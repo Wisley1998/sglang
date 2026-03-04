@@ -359,7 +359,8 @@ class Envs:
     SGLANG_CATCHUP_TIMING_DIR = EnvStr("/tmp/sglang_catchup")  # Output directory
     SGLANG_LFC_ENABLED = EnvBool(False)  # Enable LFC mode
     SGLANG_SNAPSHOT_INTERVAL = EnvInt(500)  # K value for snapshot interval
-    SGLANG_LFC_MEMORY_BUDGET_GB = EnvFloat(4.0)  # GPU memory budget for LFC factors
+    SGLANG_LFC_MEMORY_BUDGET_GB = EnvFloat(8.0)  # GPU memory budget for LFC factors
+    SGLANG_LFC_BREAK_EVEN_TOKENS = EnvInt(170)  # Below this, factors are cheaper than snapshots
     SGLANG_FORCE_RADIX_CACHE = EnvBool(False)  # Force radix cache ON for Mamba models (benchmarking)
 
     # fmt: on

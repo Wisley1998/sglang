@@ -824,39 +824,55 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     forward_batch._lfc_gdn_start_locs = query_start_loc[:len(reqs) + 1].tolist()
                 start_locs = forward_batch._lfc_gdn_start_locs
 
-                # Batch factor capture: clone full tensors once, then split
-                # into per-request views (4 clones total instead of B*4)
+                # Factor capture: clone only needed tokens.
+                # When few requests need capture (common with LFC hits),
+                # per-request clones copy less total data.
                 capture_indices = [i for i, req in enumerate(reqs)
                                    if getattr(req, '_needs_factor_capture', False)]
 
                 if capture_indices:
-                    total_offset = start_locs[0]
-                    total_end = start_locs[-1]
-                    total_len = total_end - total_offset
-
-                    if total_len > 0:
-                        # 4 batch clones instead of B*4 individual clones
-                        k_batch = key[0, total_offset:total_end].clone()
-                        v_batch = value[0, total_offset:total_end].clone()
-                        g_batch = g[0, total_offset:total_end].clone()
-                        b_batch = beta[0, total_offset:total_end].clone()
-
-                        # Zero-cost split into per-request views
-                        seq_lens = [start_locs[i + 1] - start_locs[i] for i in range(len(reqs))]
-                        k_splits = k_batch.split(seq_lens)
-                        v_splits = v_batch.split(seq_lens)
-                        g_splits = g_batch.split(seq_lens)
-                        b_splits = b_batch.split(seq_lens)
-
+                    if len(capture_indices) <= len(reqs) // 2 + 1:
+                        # Selective path: per-request clones (fewer total bytes)
                         for i in capture_indices:
-                            if seq_lens[i] > 0:
+                            start = start_locs[i]
+                            end = start_locs[i + 1]
+                            if end > start:
                                 req = reqs[i]
                                 if req.pending_lfc_factors is None:
                                     req.pending_lfc_factors = {}
                                 req.pending_lfc_factors[layer_id] = (
-                                    k_splits[i], v_splits[i],
-                                    g_splits[i], b_splits[i],
+                                    key[0, start:end].clone(),
+                                    value[0, start:end].clone(),
+                                    g[0, start:end].clone(),
+                                    beta[0, start:end].clone(),
                                 )
+                    else:
+                        # Batch path: 4 clones for entire batch + zero-cost split
+                        total_offset = start_locs[0]
+                        total_end = start_locs[-1]
+                        total_len = total_end - total_offset
+
+                        if total_len > 0:
+                            k_batch = key[0, total_offset:total_end].clone()
+                            v_batch = value[0, total_offset:total_end].clone()
+                            g_batch = g[0, total_offset:total_end].clone()
+                            b_batch = beta[0, total_offset:total_end].clone()
+
+                            seq_lens = [start_locs[i + 1] - start_locs[i] for i in range(len(reqs))]
+                            k_splits = k_batch.split(seq_lens)
+                            v_splits = v_batch.split(seq_lens)
+                            g_splits = g_batch.split(seq_lens)
+                            b_splits = b_batch.split(seq_lens)
+
+                            for i in capture_indices:
+                                if seq_lens[i] > 0:
+                                    req = reqs[i]
+                                    if req.pending_lfc_factors is None:
+                                        req.pending_lfc_factors = {}
+                                    req.pending_lfc_factors[layer_id] = (
+                                        k_splits[i], v_splits[i],
+                                        g_splits[i], b_splits[i],
+                                    )
 
             if timing_collector:
                 timing_collector.end_phase("catchup_recompute")
