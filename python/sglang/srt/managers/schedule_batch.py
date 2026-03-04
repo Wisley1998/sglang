@@ -554,6 +554,11 @@ class Req:
         # Whether this request needs factor capture for LFC
         # Set to True for prefill requests that will be inserted into the radix cache
         self._needs_factor_capture: bool = False
+        # LFC Snapshot Promotion: cache reconstruction results on prefix nodes
+        # Pool index for promotion slot (separate from request's own mamba_pool_idx)
+        self._lfc_promo_slot: Optional[torch.Tensor] = None
+        # Target prefix tree node to receive the promoted snapshot
+        self._lfc_promo_node: Optional[object] = None
 
         # Check finish
         self.tokenizer = None
@@ -1059,6 +1064,8 @@ class Req:
         self.extend_logprob_start_len = 0
         self.is_chunked = 0
         self.mamba_pool_idx = None
+        self._lfc_promo_slot = None
+        self._lfc_promo_node = None
         self.already_computed = 0
         self.kv_allocated_len = 0
         self.kv_committed_len = 0
@@ -1724,6 +1731,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
         evict_from_tree_cache(self.tree_cache, num_tokens)
 
+        # Free orphaned LFC promo slot if allocated
+        promo_slot = getattr(req, '_lfc_promo_slot', None)
+        if promo_slot is not None and hasattr(self.req_to_token_pool, 'mamba_pool'):
+            self.req_to_token_pool.mamba_pool.free(promo_slot.unsqueeze(0))
+
         req.reset_for_retract()
 
     def prepare_encoder_info_decode(self):
@@ -2015,10 +2027,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         """Collect LFC reconstruction factors from requests.
         Also sets _needs_factor_capture on prefill requests when LFC is enabled.
 
-        Factor capture is skipped for requests that already got a full mamba
-        state from CoW (mamba_pool_idx set) and don't need LFC reconstruction.
-        In these cases, the matched prefix nodes already have valid mamba state
-        and the new suffix tokens are unique per-request (unlikely to be reused).
+        Factor capture strategy:
+        - Capture for cold miss / gap requests (no CoW, no LFC recon).
+          These factors will be sliced for gap-filling short tombstoned
+          prefix nodes during the insert walk.
+        - Skip for CoW hits (snapshot already covers the position).
+        - Skip for LFC-hit requests (prefix already has factors; the
+          suffix is unique and won't be reused, so capturing is wasteful).
+
+        Note: We use _got_mamba_cow flag (set in match_prefix) instead of
+        mamba_pool_idx to distinguish CoW hits from fresh pool allocations.
+        By the time this method is called, mamba_pool_idx is always set
+        (via ReqToTokenPool.alloc), so it can't distinguish CoW from fresh.
         """
         from sglang.srt.utils.catchup_timing import is_lfc_enabled
 
@@ -2032,14 +2052,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 hasattr(req, "lfc_reconstruction_factors")
                 and req.lfc_reconstruction_factors is not None
             )
-            got_mamba_cow = getattr(req, "mamba_pool_idx", None) is not None
+            # _got_mamba_cow is set in match_prefix when CoW or LFC recon succeeds.
+            # If not set, this is a cold miss or gap scenario.
+            got_mamba_cow = getattr(req, "_got_mamba_cow", False)
 
-            # Only capture factors when:
-            # 1. Request needs LFC reconstruction (node was tombstoned), OR
-            # 2. Request is a cold miss (no mamba state from CoW) — first in group
-            # Skip when the match node has valid mamba state and no LFC needed,
-            # since suffix factors for unique per-request tokens are rarely reused.
-            req._needs_factor_capture = has_lfc_recon or not got_mamba_cow
+            # Capture factors only for cold miss / gap requests (no CoW).
+            # These factors will be sliced for gap-filling short tombstoned
+            # prefix nodes during the insert walk.
+            # Skip when: got CoW or LFC reconstruction (snapshot/factors already
+            # cover this position; the suffix is unique and won't be reused).
+            req._needs_factor_capture = not got_mamba_cow
 
             if has_lfc_recon:
                 factors[i] = req.lfc_reconstruction_factors

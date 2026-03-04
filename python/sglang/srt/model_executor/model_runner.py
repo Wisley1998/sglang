@@ -2679,12 +2679,24 @@ class ModelRunner:
         from sglang.srt.layers.attention.fla.lfc_reconstruct import (
             lfc_reconstruct_all_gdn_layers,
         )
+
+        # Build promo_info: maps req_idx -> promo pool slot index
+        promo_info = {}
+        reqs = getattr(forward_batch, "reqs", None)
+        if reqs:
+            for req_idx in lfc_factors:
+                req = reqs[req_idx]
+                promo_slot = getattr(req, '_lfc_promo_slot', None)
+                if promo_slot is not None:
+                    promo_info[req_idx] = promo_slot.item()
+
         did_reconstruct = lfc_reconstruct_all_gdn_layers(
             temporal=temporal,
             mamba_map=mamba_map,
             reconstruction_factors=lfc_factors,
             cache_indices_list=cache_indices_list,
             gdn_layer_ids=gdn_layer_ids,
+            promo_info=promo_info if promo_info else None,
         )
         if did_reconstruct:
             forward_batch._lfc_gdn_reconstructed = True

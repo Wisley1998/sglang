@@ -424,7 +424,12 @@ class MambaRadixCache(BasePrefixCache):
                 )
 
         # copy mamba state to req local space if cow is true
+        # First, realize any deferred LFC promotion on this node
+        if cow_mamba and last_node.mamba_value is None:
+            self._realize_pending_promotion(last_node)
+
         if cow_mamba and last_node.mamba_value is not None:
+            req._got_mamba_cow = True  # Flag: state came from cached snapshot
             # for reqs without mamba cache
             if req.mamba_pool_idx is None:
                 dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
@@ -444,6 +449,7 @@ class MambaRadixCache(BasePrefixCache):
                 self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
 
         elif cow_mamba and is_lfc_enabled() and last_node.lfc_factors is not None:
+            req._got_mamba_cow = True  # Flag: state came from LFC reconstruction
             # LFC path: reconstruct SSM state from ancestor + factor chain
             # 1. Walk up to nearest ancestor with full SSM state (or root)
             ancestor = last_node.parent
@@ -483,7 +489,13 @@ class MambaRadixCache(BasePrefixCache):
                 self.req_to_token_pool.mamba_pool.copy_from(
                     ancestor.mamba_value, dst_index
                 )
-            # If ancestor is root with no mamba_value, state is already zero-initialized
+            else:
+                # Ancestor is root with no mamba_value: explicitly zero the slot.
+                # Recycled pool slots may contain stale data from previous requests.
+                pool = self.req_to_token_pool.mamba_pool
+                for i in range(len(pool.mamba_cache.conv)):
+                    pool.mamba_cache.conv[i][:, dst_index] = 0
+                pool.mamba_cache.temporal[:, dst_index] = 0
 
             # 4. Store reconstruction factors on request for use during forward
             # The reconstruction will happen in forward_extend where we have access to
@@ -522,6 +534,29 @@ class MambaRadixCache(BasePrefixCache):
                             offset += n
                         result.append(buf)
                     req.lfc_reconstruction_factors[layer_id] = tuple(result)
+
+            # 5. Allocate promotion slot to cache reconstruction result on prefix node.
+            # After forward, the reconstructed state will be assigned to last_node.mamba_value
+            # so future requests can use cheap CoW instead of expensive reconstruction.
+            if last_node.mamba_value is None:
+                promo_slot = self.req_to_token_pool.mamba_pool.alloc(1)
+                if promo_slot is not None:
+                    # Copy ancestor's state as starting point for the promo slot
+                    if ancestor.mamba_value is not None:
+                        self.req_to_token_pool.mamba_pool.copy_from(
+                            ancestor.mamba_value, promo_slot
+                        )
+                    else:
+                        pool = self.req_to_token_pool.mamba_pool
+                        for i in range(len(pool.mamba_cache.conv)):
+                            pool.mamba_cache.conv[i][:, promo_slot] = 0
+                        pool.mamba_cache.temporal[:, promo_slot] = 0
+                    req._lfc_promo_slot = promo_slot[0]
+                    req._lfc_promo_node = last_node
+                    logger.debug(
+                        f"[LFC] Allocated promo slot {promo_slot[0].item()} "
+                        f"for node {last_node.id}"
+                    )
 
         if value:
             value = torch.cat(value)
@@ -694,12 +729,21 @@ class MambaRadixCache(BasePrefixCache):
             x.full_lock_ref == 0 and x.mamba_lock_ref == 0
         ), f"evict leaf node invalid with {x.id=} {x.full_lock_ref=} {x.mamba_lock_ref=}"
 
-        assert x.mamba_value is not None, f"leaf node mamba value is not None, {x.id=}"
-        # 1. a leaf node, free full tokens and mamba
+        # 1. a leaf node, free full tokens and mamba (if present)
         self.token_to_kv_pool_allocator.free(x.value)
         full_num_evicted = len(x.value)
-        self.req_to_token_pool.mamba_pool.free(x.mamba_value)
-        mamba_num_evicted = len(x.mamba_value)
+        if x.mamba_value is not None:
+            self.req_to_token_pool.mamba_pool.free(x.mamba_value)
+            mamba_num_evicted = len(x.mamba_value)
+        else:
+            # Factor-only leaf node (proactively tombstoned): no mamba to free
+            mamba_num_evicted = 0
+
+        # Free pending promotion slot if present (deferred snapshot not yet realized)
+        pending_promo = getattr(x, '_lfc_pending_mamba_value', None)
+        if pending_promo is not None:
+            self.req_to_token_pool.mamba_pool.free(pending_promo)
+            del x._lfc_pending_mamba_value
 
         # 2. get the next node, update the lru lists
         if is_evict_mamba:
@@ -707,7 +751,8 @@ class MambaRadixCache(BasePrefixCache):
         else:
             x_next = self.full_lru_list.get_prev_leaf_no_lock(x)
         self.full_lru_list.remove_node(x)
-        self.mamba_lru_list.remove_node(x)
+        if x.mamba_value is not None:
+            self.mamba_lru_list.remove_node(x)
 
         # 3. delete the leaf node
         self._delete_leaf(x)
@@ -716,6 +761,46 @@ class MambaRadixCache(BasePrefixCache):
         x, leaf_full_num_evicted = self._iteratively_delete_tombstone_leaf(x)
         full_num_evicted += leaf_full_num_evicted
         return full_num_evicted, mamba_num_evicted, x, x_next
+
+    def promote_lfc_snapshots(self, reqs):
+        """Defer promotion of reconstruction snapshots to prefix tree nodes.
+
+        After reconstruction, the promo slot contains the reconstructed SSM state.
+        We store it as a pending promotion on the node. The actual assignment to
+        mamba_value happens in the next match_prefix call, where lock_refs are
+        properly managed.
+        """
+        for req in reqs:
+            promo_slot = getattr(req, '_lfc_promo_slot', None)
+            promo_node = getattr(req, '_lfc_promo_node', None)
+            if promo_slot is None or promo_node is None:
+                continue
+            # Only promote if node still lacks mamba_value and no pending promotion
+            if promo_node.mamba_value is None and not hasattr(promo_node, '_lfc_pending_mamba_value'):
+                promo_node._lfc_pending_mamba_value = promo_slot.unsqueeze(0)
+                logger.debug(
+                    f"[LFC] Deferred promotion to node {promo_node.id}"
+                )
+            else:
+                # Node already has snapshot or pending promotion, free promo slot
+                self.req_to_token_pool.mamba_pool.free(promo_slot.unsqueeze(0))
+            req._lfc_promo_slot = None
+            req._lfc_promo_node = None
+
+    def _realize_pending_promotion(self, node: TreeNode):
+        """Realize a deferred LFC snapshot promotion on a node.
+
+        Called from match_prefix before the CoW check, so that lock_refs
+        are properly managed (inc_lock_ref will see mamba_value).
+        """
+        pending = getattr(node, '_lfc_pending_mamba_value', None)
+        if pending is not None:
+            node.mamba_value = pending
+            del node._lfc_pending_mamba_value
+            self.mamba_lru_list.insert_mru(node)
+            logger.debug(
+                f"[LFC] Realized promotion on node {node.id}"
+            )
 
     def evict_mamba(self, mamba_num: int) -> None:
         if self.disable or mamba_num <= 0:
@@ -899,14 +984,32 @@ class MambaRadixCache(BasePrefixCache):
             base_value += 1e6
         return base_value
 
-    def _lfc_try_store_factors(self, node: TreeNode, lfc_factors: dict) -> bool:
+    def _lfc_try_store_factors(self, node: TreeNode, lfc_factors: dict, gap_fill: bool = False) -> bool:
         """Try to store LFC factors on a node, respecting memory budget.
 
         Returns True if factors were stored, False if rejected.
         Only called when LFC is enabled.
+
+        Args:
+            gap_fill: If True, skip break-even check. Gap filling compares
+                factors vs NO caching (tombstoned node), so even expensive
+                factors are worthwhile. Memory budget is the only constraint.
+
+        Mutual exclusion: factors are NOT stored if the node already has a valid
+        SSM state snapshot (mamba_value), since the snapshot already encodes all
+        information from position 0 to the node's position.
         """
         if lfc_factors is None:
             return False
+
+        # Mutual exclusion: snapshot already covers this node → factors redundant
+        if node.mamba_value is not None:
+            return False
+
+        # Note: break-even check removed. Factors come from a separate memory
+        # budget (SGLANG_LFC_MEMORY_BUDGET_GB), independent of the mamba pool.
+        # Even for long nodes, factors are valuable when mamba pool snapshots
+        # are evicted under pressure. The budget cap below is the only constraint.
 
         factor_bytes = self._estimate_factor_memory(lfc_factors)
 
@@ -1169,6 +1272,22 @@ class MambaRadixCache(BasePrefixCache):
 
         child_key = self.get_child_key_fn(key)
 
+        # LFC: Track factor offset for opportunistic gap filling during walk.
+        # When a request re-forwards due to a tombstone gap, its factors cover
+        # the full extend_input_len starting from position 0. As we walk the
+        # tree matching existing nodes, factor_offset tracks which portion of
+        # the factors corresponds to the current node.
+        lfc_enabled = is_lfc_enabled()
+        from sglang.srt.environ import envs
+        break_even = envs.SGLANG_LFC_BREAK_EVEN_TOKENS.value if lfc_enabled else 0
+        factor_offset = 0
+        factor_len = 0
+        if lfc_enabled and lfc_factors is not None:
+            # Get total factor token count from any layer's first tensor
+            for _layer_id, _ftuple in lfc_factors.items():
+                factor_len = _ftuple[0].shape[0]
+                break
+
         total_prefix_length = 0
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
@@ -1177,46 +1296,117 @@ class MambaRadixCache(BasePrefixCache):
             if node.mamba_value is not None:
                 self.mamba_lru_list.reset_node_mru(node)
             prefix_len = self.key_match_fn(node.key, key)
-            total_prefix_length += prefix_len
-            key = key[prefix_len:]
-            value = value[prefix_len:]
 
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
                 node = new_node
 
+            # LFC: Opportunistic gap filling — when walking through a
+            # tombstoned node (no mamba_value, no lfc_factors) whose token
+            # range is covered by the current request's factors, slice and
+            # store factors on it. This enables LFC reconstruction for
+            # future requests that match this prefix.
+            # Placed AFTER the split so we fill the clean prefix node,
+            # avoiding empty-tensor factors on the suffix child.
+            # Note: no break_even check here — gap filling compares factors
+            # vs NO caching (tombstoned), so any factors are worthwhile.
+            # Memory budget in _lfc_try_store_factors is the only constraint.
+            if (lfc_enabled and lfc_factors is not None
+                    and node.mamba_value is None
+                    and node.lfc_factors is None
+                    and node != self.root_node
+                    and factor_offset + prefix_len <= factor_len):
+                sliced_factors = {}
+                for layer_id, factor_tuple in lfc_factors.items():
+                    sliced_factors[layer_id] = tuple(
+                        t[factor_offset:factor_offset + prefix_len].clone()
+                        for t in factor_tuple
+                    )
+                self._lfc_try_store_factors(node, sliced_factors, gap_fill=True)
+
+            factor_offset += prefix_len
+            total_prefix_length += prefix_len
+            key = key[prefix_len:]
+            value = value[prefix_len:]
+
             if len(key):
                 child_key = self.get_child_key_fn(key)
 
+        # Adjust lfc_factors to only cover remaining (unconsumed) tokens
+        if lfc_factors is not None and factor_offset > 0:
+            if factor_offset >= factor_len:
+                lfc_factors = None
+            else:
+                remaining_factors = {}
+                for layer_id, factor_tuple in lfc_factors.items():
+                    remaining_factors[layer_id] = tuple(
+                        t[factor_offset:] for t in factor_tuple
+                    )
+                lfc_factors = remaining_factors
+
         mamba_value_exist = False
+        use_factors_only = (
+            lfc_enabled
+            and lfc_factors is not None
+            and len(key) < break_even
+        )
+
         if len(key):
             new_node = TreeNode()
             new_node.parent = node
             new_node.key = key
             new_node.value = value
-            new_node.mamba_value = mamba_value
-            # Attach LFC factors with memory budget check (LFC-only)
-            if is_lfc_enabled() and lfc_factors is not None:
+
+            if use_factors_only:
+                # Short segment: store factors, skip snapshot.
+                # The factors are ~1% of snapshot size per token, so for
+                # segments < break_even tokens, factors use less memory.
+                new_node.mamba_value = None
                 self._lfc_try_store_factors(new_node, lfc_factors)
-            self.full_lru_list.insert_mru(new_node)
-            self.mamba_lru_list.insert_mru(new_node)
-            node.children[child_key] = new_node
-            self.full_evictable_size_ += len(value)
-            self.mamba_evictable_size_ += len(mamba_value)
+                self.full_lru_list.insert_mru(new_node)
+                # Not in mamba_lru (no mamba_value)
+                node.children[child_key] = new_node
+                self.full_evictable_size_ += len(value)
+                # Signal caller to free the unused mamba_value
+                mamba_value_exist = True
+            else:
+                # Long segment or no factors: store snapshot as usual
+                new_node.mamba_value = mamba_value
+                # Also store LFC factors alongside snapshot. When the snapshot
+                # is later evicted (tombstoned) or the node is split, the
+                # factors survive and enable LFC reconstruction.
+                if lfc_enabled and lfc_factors is not None:
+                    self._lfc_try_store_factors(new_node, lfc_factors)
+                self.full_lru_list.insert_mru(new_node)
+                self.mamba_lru_list.insert_mru(new_node)
+                node.children[child_key] = new_node
+                self.full_evictable_size_ += len(value)
+                self.mamba_evictable_size_ += len(mamba_value)
         elif node.mamba_value is None:  # add for mamba tombstone
-            node.mamba_value = mamba_value
-            # Attach LFC factors with memory budget check (LFC-only)
-            if is_lfc_enabled() and lfc_factors is not None:
+            if use_factors_only and node.lfc_factors is not None:
+                # Node already has factors from before — no need to restore snapshot
+                mamba_value_exist = True
+                self.full_lru_list.reset_node_mru(node)
+                node.last_access_time = get_last_access_time()
+            elif use_factors_only:
+                # Store factors instead of restoring snapshot
                 self._lfc_try_store_factors(node, lfc_factors)
-            self.full_lru_list.reset_node_mru(node)
-            self.mamba_lru_list.insert_mru(node)
-            self.mamba_evictable_size_ += len(mamba_value)
-            node.last_access_time = get_last_access_time()
+                mamba_value_exist = True
+                self.full_lru_list.reset_node_mru(node)
+                node.last_access_time = get_last_access_time()
+            else:
+                # Restore snapshot as usual
+                node.mamba_value = mamba_value
+                # Also store factors for resilience after future tombstoning
+                if lfc_enabled and lfc_factors is not None and node.lfc_factors is None:
+                    self._lfc_try_store_factors(node, lfc_factors)
+                self.full_lru_list.reset_node_mru(node)
+                self.mamba_lru_list.insert_mru(node)
+                self.mamba_evictable_size_ += len(mamba_value)
+                node.last_access_time = get_last_access_time()
         else:  # mamba value already exists
             mamba_value_exist = True
-            # Opportunistically store LFC factors if missing
-            if is_lfc_enabled() and lfc_factors is not None and node.lfc_factors is None:
-                self._lfc_try_store_factors(node, lfc_factors)
+            # Snapshot exists → factors are redundant, don't store
             self.full_lru_list.reset_node_mru(node)
             self.mamba_lru_list.reset_node_mru(node)
             node.last_access_time = get_last_access_time()
@@ -1247,9 +1437,6 @@ class MambaRadixCache(BasePrefixCache):
         return node, full_num_evicted
 
     def _delete_leaf(self, node: TreeNode) -> None:
-        assert (
-            node.mamba_value is not None
-        ), f"Invariant violated: leaf node is a tombstone, {node.id=}"
         assert len(node.children) == 0, f"leaf node has children, {node.id=}"
         # Clean up LFC factor memory tracking
         if is_lfc_enabled():
@@ -1259,7 +1446,8 @@ class MambaRadixCache(BasePrefixCache):
         assert v == node, f"parent does not have child key, {key}"
 
         self.full_evictable_size_ -= len(node.key)
-        self.mamba_evictable_size_ -= len(node.mamba_value)
+        if node.mamba_value is not None:
+            self.mamba_evictable_size_ -= len(node.mamba_value)
 
     def _tombstone_internal_node(self, node: TreeNode) -> None:
         assert len(node.children) != 0, f"Cannot tombstone a leaf node, {node.id=}"
@@ -1273,6 +1461,11 @@ class MambaRadixCache(BasePrefixCache):
             node.mamba_value is None
         ), f"Deleting a unexpected non-tombstone leaf node, {node.id=}"
         assert len(node.children) == 0, f"leaf node has children, {node.id=}"
+        # Free pending promotion slot if present
+        pending_promo = getattr(node, '_lfc_pending_mamba_value', None)
+        if pending_promo is not None:
+            self.req_to_token_pool.mamba_pool.free(pending_promo)
+            del node._lfc_pending_mamba_value
         # Clean up LFC factor memory tracking
         if is_lfc_enabled():
             self._lfc_remove_factors(node)

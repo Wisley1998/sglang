@@ -72,6 +72,10 @@ class SchedulerOutputProcessorMixin:
             if result.copy_done is not None:
                 result.copy_done.synchronize()
 
+            # Promote LFC reconstruction snapshots to prefix tree nodes
+            if hasattr(self.tree_cache, 'promote_lfc_snapshots'):
+                self.tree_cache.promote_lfc_snapshots(batch.reqs)
+
             (
                 logits_output,
                 next_token_ids,

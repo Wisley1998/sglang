@@ -498,40 +498,56 @@ class MambaMixer2(torch.nn.Module):
                     forward_batch._lfc_mamba_start_locs = query_start_loc_p[:num_prefills + 1].tolist()
                 start_locs = forward_batch._lfc_mamba_start_locs
 
-                # Batch factor capture: clone full tensors once, then split
-                # into per-request views (4 clones total instead of B*4)
+                # Factor capture: clone only needed tokens.
+                # When few requests need capture (common with LFC hits),
+                # per-request clones copy less total data.
                 prefill_reqs = forward_batch.reqs[:num_prefills]
                 capture_indices = [i for i, req in enumerate(prefill_reqs)
                                    if getattr(req, '_needs_factor_capture', False)]
 
                 if capture_indices:
-                    total_offset = start_locs[0]
-                    total_end = start_locs[-1]
-                    total_len = total_end - total_offset
-
-                    if total_len > 0:
-                        # 4 batch clones instead of B*4 individual clones
-                        h_batch = hidden_states_p[total_offset:total_end].clone()
-                        b_batch = B_p[total_offset:total_end].clone()
-                        c_batch = C_p[total_offset:total_end].clone()
-                        dt_batch = dt_p[total_offset:total_end].clone()
-
-                        # Zero-cost split into per-request views
-                        seq_lens = [start_locs[i + 1] - start_locs[i] for i in range(num_prefills)]
-                        h_splits = h_batch.split(seq_lens)
-                        b_splits = b_batch.split(seq_lens)
-                        c_splits = c_batch.split(seq_lens)
-                        dt_splits = dt_batch.split(seq_lens)
-
+                    if len(capture_indices) <= num_prefills // 2 + 1:
+                        # Selective path: per-request clones (fewer total bytes)
                         for i in capture_indices:
-                            if seq_lens[i] > 0:
+                            start = start_locs[i]
+                            end = start_locs[i + 1]
+                            if end > start:
                                 req = prefill_reqs[i]
                                 if req.pending_lfc_factors is None:
                                     req.pending_lfc_factors = {}
                                 req.pending_lfc_factors[layer_id] = (
-                                    h_splits[i], b_splits[i],
-                                    c_splits[i], dt_splits[i],
+                                    hidden_states_p[start:end].clone(),
+                                    B_p[start:end].clone(),
+                                    C_p[start:end].clone(),
+                                    dt_p[start:end].clone(),
                                 )
+                    else:
+                        # Batch path: 4 clones for entire batch + zero-cost split
+                        total_offset = start_locs[0]
+                        total_end = start_locs[-1]
+                        total_len = total_end - total_offset
+
+                        if total_len > 0:
+                            h_batch = hidden_states_p[total_offset:total_end].clone()
+                            b_batch = B_p[total_offset:total_end].clone()
+                            c_batch = C_p[total_offset:total_end].clone()
+                            dt_batch = dt_p[total_offset:total_end].clone()
+
+                            seq_lens = [start_locs[i + 1] - start_locs[i] for i in range(num_prefills)]
+                            h_splits = h_batch.split(seq_lens)
+                            b_splits = b_batch.split(seq_lens)
+                            c_splits = c_batch.split(seq_lens)
+                            dt_splits = dt_batch.split(seq_lens)
+
+                            for i in capture_indices:
+                                if seq_lens[i] > 0:
+                                    req = prefill_reqs[i]
+                                    if req.pending_lfc_factors is None:
+                                        req.pending_lfc_factors = {}
+                                    req.pending_lfc_factors[layer_id] = (
+                                        h_splits[i], b_splits[i],
+                                        c_splits[i], dt_splits[i],
+                                    )
 
             # 3. State Space Model sequence transformation
             initial_states = None
@@ -625,6 +641,11 @@ class MambaMixer2(torch.nn.Module):
                     )
                     ssm_state[cache_idx] = final_state.squeeze(0).to(ssm_state.dtype)
 
+                    # Promotion: copy to promo slot
+                    promo_slot = getattr(forward_batch.reqs[recon_indices[0]], '_lfc_promo_slot', None)
+                    if promo_slot is not None:
+                        ssm_state[promo_slot.item()] = ssm_state[cache_idx]
+
                     if initial_states is not None:
                         initial_states[recon_indices[0]] = ssm_state[cache_idx]
 
@@ -707,6 +728,10 @@ class MambaMixer2(torch.nn.Module):
                     for idx in range(N_recon):
                         cache_idx = recon_cache_idxs[idx]
                         ssm_state[cache_idx] = varlen_state[idx].to(ssm_state.dtype)
+                        # Promotion: copy to promo slot
+                        promo_slot = getattr(forward_batch.reqs[recon_indices[idx]], '_lfc_promo_slot', None)
+                        if promo_slot is not None:
+                            ssm_state[promo_slot.item()] = ssm_state[cache_idx]
                         if initial_states is not None:
                             initial_states[recon_indices[idx]] = ssm_state[cache_idx]
 

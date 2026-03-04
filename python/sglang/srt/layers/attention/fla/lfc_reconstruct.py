@@ -621,19 +621,115 @@ class LFCFactorCache:
         )
 
 
+@triton.jit
+def _lfc_reconstruct_state_varlen_kernel(
+    # Pointers to matrices
+    snapshot_ptr,  # [N, H_v, K, V]
+    k_flat_ptr,  # [total_tokens, H_k, K]  (concatenated, no padding)
+    v_flat_ptr,  # [total_tokens, H_v, V]
+    g_flat_ptr,  # [total_tokens, H_v]
+    beta_flat_ptr,  # [total_tokens, H_v]
+    cu_seqlens_ptr,  # [N + 1]  cumulative sequence lengths
+    output_ptr,  # [N, H_v, K, V]
+    # Matrix dimensions
+    N,
+    H_v,
+    H_k,
+    K,
+    V,
+    # Strides for snapshot [N, H_v, K, V]
+    stride_snap_n,
+    stride_snap_h,
+    stride_snap_k,
+    # Strides for k_flat [total_tokens, H_k, K]
+    stride_kf_t,
+    stride_kf_h,
+    # Strides for v_flat [total_tokens, H_v, V]
+    stride_vf_t,
+    stride_vf_h,
+    # Strides for g_flat/beta_flat [total_tokens, H_v]
+    stride_gf_t,
+    # Strides for output [N, H_v, K, V]
+    stride_out_n,
+    stride_out_h,
+    stride_out_k,
+    # Block sizes
+    BLOCK_K: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+):
+    """
+    Variable-length Triton kernel for LFC state reconstruction.
+
+    Uses flat (packed) factor buffers with cu_seqlens offsets, avoiding
+    the massive zero-padded tensor allocation of the batched kernel.
+    Each program handles one (pair, head) combination and processes
+    only its actual factor tokens (no wasted iterations on padding).
+    """
+    pid_n = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    # GQA: map value head to key head
+    pid_h_k = pid_h // (H_v // H_k)
+
+    # Load per-pair start/end from cu_seqlens
+    my_start = tl.load(cu_seqlens_ptr + pid_n)
+    my_end = tl.load(cu_seqlens_ptr + pid_n + 1)
+
+    # Load initial state from snapshot
+    snap_base = snapshot_ptr + pid_n * stride_snap_n + pid_h * stride_snap_h
+    k_offs = tl.arange(0, BLOCK_K)
+    v_offs = tl.arange(0, BLOCK_V)
+    k_mask = k_offs < K
+    v_mask = v_offs < V
+    mask = k_mask[:, None] & v_mask[None, :]
+
+    ptrs = snap_base + k_offs[:, None] * stride_snap_k + v_offs[None, :]
+    state = tl.load(ptrs, mask=mask, other=0.0)
+
+    # Process factor tokens — loop over actual token range only
+    t = my_start
+    while t < my_end:
+        # Load gating factor g[t]
+        g = tl.load(g_flat_ptr + t * stride_gf_t + pid_h)
+
+        # Load beta factor beta[t]
+        beta_val = tl.load(beta_flat_ptr + t * stride_gf_t + pid_h)
+
+        # Load k[t] vector (key head via GQA mapping)
+        k_base = k_flat_ptr + t * stride_kf_t + pid_h_k * stride_kf_h
+        k_vec = tl.load(k_base + k_offs, mask=k_mask, other=0.0)
+
+        # Load v[t] vector (value head)
+        v_base = v_flat_ptr + t * stride_vf_t + pid_h * stride_vf_h
+        v_vec = tl.load(v_base + v_offs, mask=v_mask, other=0.0)
+
+        # outer product + gated update
+        outer = k_vec[:, None] * v_vec[None, :]
+        state = state * tl.exp(g) + beta_val * outer
+
+        t += 1
+
+    # Store output state
+    out_base = output_ptr + pid_n * stride_out_n + pid_h * stride_out_h
+    out_ptrs = out_base + k_offs[:, None] * stride_out_k + v_offs[None, :]
+    tl.store(out_ptrs, state, mask=mask)
+
+
 def lfc_reconstruct_all_gdn_layers(
     temporal: torch.Tensor,
     mamba_map: dict,
     reconstruction_factors: dict,
     cache_indices_list: list,
     gdn_layer_ids: list,
+    promo_info: Optional[dict] = None,
 ) -> bool:
     """
-    Fused cross-layer GDN reconstruction — single kernel launch for all layers.
+    Fused cross-layer GDN reconstruction using varlen kernel.
 
-    Instead of launching one batched kernel per GDN layer (18 launches),
-    this function packs all (layer, request) pairs into a single batch
-    and calls lfc_reconstruct_state_batched once.
+    Packs all (layer, request) pairs' factor tokens into flat buffers
+    with cu_seqlens offsets, then launches a single varlen kernel.
+    This avoids the massive padded tensor allocation of the previous
+    batched approach (which could reach 10-20+ GB for typical workloads).
 
     Args:
         temporal: Full SSM state tensor [num_physical_layers, num_slots, H_v, K, V]
@@ -641,6 +737,7 @@ def lfc_reconstruct_all_gdn_layers(
         reconstruction_factors: Dict mapping req_idx -> {layer_id: (k, v, g, beta)}
         cache_indices_list: List of cache indices per request
         gdn_layer_ids: List of GDN layer IDs (logical) to reconstruct
+        promo_info: Optional dict mapping req_idx -> promo pool slot index for snapshot promotion
 
     Returns:
         True if any reconstructions were performed, False otherwise.
@@ -648,12 +745,11 @@ def lfc_reconstruct_all_gdn_layers(
     if not reconstruction_factors:
         return False
 
-    gdn_layer_set = set(gdn_layer_ids)
-
     # Collect all (layer, request) pairs needing GDN reconstruction
     snapshots_list = []
     k_list, v_list, g_list, beta_list = [], [], [], []
     scatter_targets = []  # (physical_layer_idx, cache_idx) for scatter-back
+    scatter_req_indices = []  # which req_idx each scatter target belongs to
 
     for req_idx, req_factors in reconstruction_factors.items():
         if req_factors is None:
@@ -671,6 +767,7 @@ def lfc_reconstruct_all_gdn_layers(
             g_list.append(g_f)
             beta_list.append(beta_f)
             scatter_targets.append((phys_idx, cache_idx))
+            scatter_req_indices.append(req_idx)
 
     if not scatter_targets:
         return False
@@ -678,25 +775,86 @@ def lfc_reconstruct_all_gdn_layers(
     n_pairs = len(scatter_targets)
 
     if n_pairs == 1:
-        # Single pair: use non-batched kernel to avoid padding overhead
+        # Single pair: direct kernel launch, no batching overhead
         phys_idx, cache_idx = scatter_targets[0]
-        result = lfc_reconstruct_state(
-            snapshots_list[0].unsqueeze(0),
-            k_list[0].unsqueeze(0),
-            v_list[0].unsqueeze(0),
-            g_list[0].unsqueeze(0),
-            beta_list[0].unsqueeze(0),
-        )
-        temporal[phys_idx, cache_idx] = result.squeeze(0).to(temporal.dtype)
-    else:
-        # Batch all (layer, request) pairs into single kernel launch
-        snapshots = torch.stack(snapshots_list)  # [N_pairs, H_v, K, V]
-        result = lfc_reconstruct_state_batched(
-            snapshots, k_list, v_list, g_list, beta_list,
-        )
-        # Scatter results back to per-layer SSM state pools
-        result_typed = result.to(temporal.dtype, copy=False)
-        for i, (phys_idx, cache_idx) in enumerate(scatter_targets):
-            temporal[phys_idx, cache_idx] = result_typed[i]
+        if k_list[0].shape[0] > 0:
+            result = lfc_reconstruct_state(
+                snapshots_list[0].unsqueeze(0),
+                k_list[0].unsqueeze(0),
+                v_list[0].unsqueeze(0),
+                g_list[0].unsqueeze(0),
+                beta_list[0].unsqueeze(0),
+            )
+            result_cast = result.squeeze(0).to(temporal.dtype)
+            temporal[phys_idx, cache_idx] = result_cast
+            # Promotion: also write to promo slot
+            if promo_info and scatter_req_indices[0] in promo_info:
+                temporal[phys_idx, promo_info[scatter_req_indices[0]]] = result_cast
+        return True
+
+    # --- Varlen path: pack factors into flat buffers + cu_seqlens ---
+    device = snapshots_list[0].device
+    H_v = snapshots_list[0].shape[0]
+    K = snapshots_list[0].shape[1]
+    V = snapshots_list[0].shape[2]
+    H_k = k_list[0].shape[1]
+
+    # Build cu_seqlens from per-pair delta lengths
+    deltas = [kf.shape[0] for kf in k_list]
+    cu_seqlens_list = [0]
+    for d in deltas:
+        cu_seqlens_list.append(cu_seqlens_list[-1] + d)
+    total_tokens = cu_seqlens_list[-1]
+
+    if total_tokens == 0:
+        return False
+
+    cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int32, device=device)
+
+    # Concatenate factor tensors into flat buffers (no padding!)
+    # This uses exactly total_tokens * features memory instead of
+    # n_pairs * max_delta * features (which can be 10-100x larger).
+    k_flat = torch.cat(k_list, dim=0).contiguous().float()  # [total_tokens, H_k, K]
+    v_flat = torch.cat(v_list, dim=0).contiguous().float()  # [total_tokens, H_v, V]
+    g_flat = torch.cat(g_list, dim=0).contiguous().float()  # [total_tokens, H_v]
+    beta_flat = torch.cat(beta_list, dim=0).contiguous().float()  # [total_tokens, H_v]
+
+    # Stack snapshots
+    snapshots = torch.stack(snapshots_list).contiguous().float()  # [N, H_v, K, V]
+    output = torch.empty_like(snapshots)
+
+    BLOCK_K = triton.next_power_of_2(K)
+    BLOCK_V = triton.next_power_of_2(V)
+
+    grid = (n_pairs, H_v)
+    _lfc_reconstruct_state_varlen_kernel[grid](
+        snapshots,
+        k_flat,
+        v_flat,
+        g_flat,
+        beta_flat,
+        cu_seqlens,
+        output,
+        n_pairs, H_v, H_k, K, V,
+        # snapshot strides [N, H_v, K, V]
+        snapshots.stride(0), snapshots.stride(1), snapshots.stride(2),
+        # k_flat strides [total_tokens, H_k, K]
+        k_flat.stride(0), k_flat.stride(1),
+        # v_flat strides [total_tokens, H_v, V]
+        v_flat.stride(0), v_flat.stride(1),
+        # g_flat strides [total_tokens, H_v]
+        g_flat.stride(0),
+        # output strides [N, H_v, K, V]
+        output.stride(0), output.stride(1), output.stride(2),
+        BLOCK_K=BLOCK_K, BLOCK_V=BLOCK_V,
+    )
+
+    # Scatter results back to per-layer SSM state pools
+    result_typed = output.to(temporal.dtype, copy=False)
+    for i, (phys_idx, cache_idx) in enumerate(scatter_targets):
+        temporal[phys_idx, cache_idx] = result_typed[i]
+        # Promotion: also write to promo slot
+        if promo_info and scatter_req_indices[i] in promo_info:
+            temporal[phys_idx, promo_info[scatter_req_indices[i]]] = result_typed[i]
 
     return True
