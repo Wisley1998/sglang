@@ -1524,6 +1524,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     {
                         "completion_tokens": recv_obj.completion_tokens[i],
                         "cached_tokens": recv_obj.cached_tokens[i],
+                        "attn_potential_hit_tokens": recv_obj.attn_potential_hit_tokens[i],
+                        "mamba_hit_tokens": recv_obj.mamba_hit_tokens[i],
                     }
                 )
 

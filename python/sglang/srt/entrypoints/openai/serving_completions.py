@@ -200,6 +200,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
         prompt_tokens = {}
         completion_tokens = {}
         cached_tokens = {}
+        attn_potential_hit_tokens = {}
+        mamba_hit_tokens = {}
         hidden_states = {}
 
         try:
@@ -212,6 +214,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 prompt_tokens[index] = content["meta_info"]["prompt_tokens"]
                 completion_tokens[index] = content["meta_info"]["completion_tokens"]
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
+                attn_potential_hit_tokens[index] = content["meta_info"].get("attn_potential_hit_tokens", 0)
+                mamba_hit_tokens[index] = content["meta_info"].get("mamba_hit_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
 
                 stream_buffer = stream_buffers.get(index, "")
@@ -315,6 +319,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     prompt_tokens,
                     completion_tokens,
                     cached_tokens,
+                    attn_potential_hit_tokens,
+                    mamba_hit_tokens,
                     n_choices=request.n,
                     enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
                 )

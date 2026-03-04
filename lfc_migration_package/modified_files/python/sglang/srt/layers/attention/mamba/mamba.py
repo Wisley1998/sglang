@@ -13,6 +13,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.distributed.utils import divide
 from sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2Metadata
 from sglang.srt.layers.attention.mamba.mixer2_rms_norm_gated import Mixer2RMSNormGated
 from sglang.srt.layers.attention.mamba.ops import (
@@ -341,6 +342,7 @@ class MambaMixer2(torch.nn.Module):
             input_is_parallel=True,
             quant_config=quant_config,
             prefix=f"{prefix}.out_proj",
+            reduce_results=False,
         )
 
         self.norm = Mixer2RMSNormGated(
@@ -366,7 +368,7 @@ class MambaMixer2(torch.nn.Module):
         # modes; they are computed at top-level model forward since they
         # stay the same and reused for all mamba layers in the same iteration
         state_indices_tensor = metadata.mamba_cache_indices
-        conv_state = layer_cache.conv[0]
+        conv_state = layer_cache.conv
         ssm_state = layer_cache.temporal
 
         query_start_loc = metadata.query_start_loc
@@ -403,15 +405,10 @@ class MambaMixer2(torch.nn.Module):
 
         num_prefills = metadata.num_prefills  # request count
         num_decodes = metadata.num_decodes  # token count (=request)
-        num_decode_tokens = (
-            num_decodes * metadata.draft_token_num
-            if metadata.is_target_verify
-            else num_decodes
-        )
         num_prefill_tokens = metadata.num_prefill_tokens  # token count
         has_prefill = num_prefills > 0
         has_decode = num_decodes > 0
-        num_actual_tokens = num_prefill_tokens + num_decode_tokens
+        num_actual_tokens = num_prefill_tokens + num_decodes
         assert num_actual_tokens == projected_states.shape[0]
 
         # NOTE: V0 put prefill before decode
@@ -419,12 +416,12 @@ class MambaMixer2(torch.nn.Module):
         # Split along token dimension
         hidden_states_B_C_p, hidden_states_B_C_d = torch.split(
             hidden_states_B_C,
-            [num_prefill_tokens, num_decode_tokens],
+            [num_prefill_tokens, num_decodes],
             dim=0,
         )
         dt_p, dt_d = torch.split(
             dt,
-            [num_prefill_tokens, num_decode_tokens],
+            [num_prefill_tokens, num_decodes],
             dim=0,
         )
         # Split along batch dimension
@@ -448,7 +445,7 @@ class MambaMixer2(torch.nn.Module):
         )
         preallocated_ssm_out_p, preallocated_ssm_out_d = torch.split(
             preallocated_ssm_out,
-            [num_prefill_tokens, num_decode_tokens],
+            [num_prefill_tokens, num_decodes],
             dim=0,
         )
 
@@ -485,53 +482,28 @@ class MambaMixer2(torch.nn.Module):
             hidden_states_p, B_p, C_p = split_hidden_states_B_C_fn(hidden_states_B_C_p)
 
             # LFC: Check if enabled for factor capture/reconstruction
-            # Cache is_lfc_enabled() on forward_batch to avoid per-layer env lookups
-            if not hasattr(forward_batch, '_lfc_enabled'):
-                forward_batch._lfc_enabled = is_lfc_enabled()
-            lfc_enabled = forward_batch._lfc_enabled
+            lfc_enabled = is_lfc_enabled()
 
             # LFC: Factor capture - store factors for each request
             # Factors: (hidden_states, B, C, dt) after conv1d projection
             if lfc_enabled and forward_batch is not None and forward_batch.reqs is not None:
-                # Cache .tolist() on forward_batch to avoid per-layer GPU syncs
-                if not hasattr(forward_batch, '_lfc_mamba_start_locs'):
-                    forward_batch._lfc_mamba_start_locs = query_start_loc_p[:num_prefills + 1].tolist()
-                start_locs = forward_batch._lfc_mamba_start_locs
-
-                # Batch factor capture: clone full tensors once, then split
-                # into per-request views (4 clones total instead of B*4)
-                prefill_reqs = forward_batch.reqs[:num_prefills]
-                capture_indices = [i for i, req in enumerate(prefill_reqs)
-                                   if getattr(req, '_needs_factor_capture', False)]
-
-                if capture_indices:
-                    total_offset = start_locs[0]
-                    total_end = start_locs[-1]
-                    total_len = total_end - total_offset
-
-                    if total_len > 0:
-                        # 4 batch clones instead of B*4 individual clones
-                        h_batch = hidden_states_p[total_offset:total_end].clone()
-                        b_batch = B_p[total_offset:total_end].clone()
-                        c_batch = C_p[total_offset:total_end].clone()
-                        dt_batch = dt_p[total_offset:total_end].clone()
-
-                        # Zero-cost split into per-request views
-                        seq_lens = [start_locs[i + 1] - start_locs[i] for i in range(num_prefills)]
-                        h_splits = h_batch.split(seq_lens)
-                        b_splits = b_batch.split(seq_lens)
-                        c_splits = c_batch.split(seq_lens)
-                        dt_splits = dt_batch.split(seq_lens)
-
-                        for i in capture_indices:
-                            if seq_lens[i] > 0:
-                                req = prefill_reqs[i]
-                                if req.pending_lfc_factors is None:
-                                    req.pending_lfc_factors = {}
-                                req.pending_lfc_factors[layer_id] = (
-                                    h_splits[i], b_splits[i],
-                                    c_splits[i], dt_splits[i],
-                                )
+                start_locs = query_start_loc_p[:num_prefills + 1].tolist()
+                for i, req in enumerate(forward_batch.reqs[:num_prefills]):
+                    if not getattr(req, '_needs_factor_capture', False):
+                        continue
+                    start_idx = start_locs[i]
+                    end_idx = start_locs[i + 1]
+                    factor_seq_len = end_idx - start_idx
+                    if factor_seq_len > 0:
+                        if not hasattr(req, "pending_lfc_factors") or req.pending_lfc_factors is None:
+                            req.pending_lfc_factors = {}
+                        # Store Mamba2-specific factors for this layer
+                        req.pending_lfc_factors[layer_id] = (
+                            hidden_states_p[start_idx:end_idx].clone(),
+                            B_p[start_idx:end_idx].clone(),
+                            C_p[start_idx:end_idx].clone(),
+                            dt_p[start_idx:end_idx].clone(),
+                        )
 
             # 3. State Space Model sequence transformation
             initial_states = None
@@ -546,169 +518,93 @@ class MambaMixer2(torch.nn.Module):
             # For Mamba2, use mamba_chunk_scan_combined to reconstruct state
             # Factors are pre-merged (concat'd) per layer in match_prefix,
             # so each layer only needs a single kernel call.
-            # Batched: pack all requests into a single varlen call.
             if lfc_enabled and forward_batch is not None and forward_batch.lfc_reconstruction_factors is not None:
-                # Cache .tolist() on forward_batch to avoid per-layer GPU syncs
-                if not hasattr(forward_batch, '_lfc_mamba_cache_indices_list'):
-                    forward_batch._lfc_mamba_cache_indices_list = state_indices_tensor_p[:num_prefills].tolist()
-                cache_indices_list = forward_batch._lfc_mamba_cache_indices_list
+                cache_indices_list = state_indices_tensor_p[:num_prefills].tolist()
 
-                # Gather phase: collect all requests needing reconstruction
-                recon_indices = []  # indices into cache_indices_list
-                recon_cache_idxs = []
-                h_list, B_list, C_list, dt_list = [], [], [], []
-                deltas = []
+                # Pre-allocate buffers for reconstruction metadata tensors
+                # Find max seq_len across all requests that need reconstruction
+                max_recon_seq_len = 0
+                for i in range(num_prefills):
+                    req_factors = forward_batch.lfc_reconstruction_factors.get(i)
+                    if req_factors is not None and layer_id in req_factors:
+                        max_recon_seq_len = max(
+                            max_recon_seq_len,
+                            req_factors[layer_id][0].shape[0],
+                        )
+
+                chunk_sz = mixed_metadata.chunk_size
+                if max_recon_seq_len > 0:
+                    recon_device = hidden_states.device
+                    max_chunks = math.ceil(max_recon_seq_len / chunk_sz)
+                    buf_seq_idx = torch.zeros(
+                        (1, max_recon_seq_len), dtype=torch.int32, device=recon_device
+                    )
+                    buf_chunk_indices = torch.arange(
+                        max_chunks, dtype=torch.int32, device=recon_device
+                    )
+                    buf_chunk_offsets = torch.zeros(
+                        max_chunks, dtype=torch.int32, device=recon_device
+                    )
+
                 for i in range(num_prefills):
                     req_factors = forward_batch.lfc_reconstruction_factors.get(i)
                     if req_factors is not None and layer_id in req_factors:
                         factors = req_factors[layer_id]
+                        cache_idx = cache_indices_list[i]
                         h_factors, B_factors, C_factors, dt_factors = factors
                         seq_len = h_factors.shape[0]
+
                         if seq_len > 0:
-                            recon_indices.append(i)
-                            recon_cache_idxs.append(cache_indices_list[i])
-                            h_list.append(h_factors)
-                            B_list.append(B_factors)
-                            C_list.append(C_factors)
-                            dt_list.append(dt_factors)
-                            deltas.append(seq_len)
+                            nheads_tp = self.num_heads // self.tp_size
+                            ngroups_tp = self.n_groups // self.tp_size
 
-                N_recon = len(recon_indices)
-                chunk_sz = mixed_metadata.chunk_size
+                            # Reshape for mamba_chunk_scan_combined
+                            h_reshaped = h_factors.view(1, seq_len, nheads_tp, self.head_dim)
+                            dt_reshaped = dt_factors.unsqueeze(0)
+                            B_reshaped = B_factors.view(1, seq_len, ngroups_tp, -1)
+                            C_reshaped = C_factors.view(1, seq_len, ngroups_tp, -1)
 
-                if N_recon == 1:
-                    # Single request: use original per-request path (avoids padding overhead)
-                    nheads_tp = self.num_heads // self.tp_size
-                    ngroups_tp = self.n_groups // self.tp_size
-                    seq_len = deltas[0]
-                    cache_idx = recon_cache_idxs[0]
+                            # Use pre-allocated buffers via slice views
+                            n_chunks = math.ceil(seq_len / chunk_sz)
+                            recon_seq_idx = buf_seq_idx[:, :seq_len]
+                            recon_chunk_indices = buf_chunk_indices[:n_chunks]
+                            recon_chunk_offsets = buf_chunk_offsets[:n_chunks]
 
-                    h_reshaped = h_list[0].view(1, seq_len, nheads_tp, self.head_dim)
-                    dt_reshaped = dt_list[0].unsqueeze(0)
-                    B_reshaped = B_list[0].view(1, seq_len, ngroups_tp, -1)
-                    C_reshaped = C_list[0].view(1, seq_len, ngroups_tp, -1)
+                            recon_out = torch.empty_like(h_reshaped)
+                            # Cast initial_states to float32 and pass
+                            # state_dtype=float32 so internal states also
+                            # use float32. This avoids a Triton type
+                            # conflict (prev_states_ptr vs initstates_ptr).
+                            current_state = ssm_state[cache_idx:cache_idx + 1]
+                            init_fp32 = current_state.to(torch.float32)
+                            final_state = mamba_chunk_scan_combined(
+                                h_reshaped,
+                                dt_reshaped,
+                                self.A,
+                                B_reshaped,
+                                C_reshaped,
+                                chunk_size=chunk_sz,
+                                D=self.D,
+                                z=None,
+                                dt_bias=self.dt_bias,
+                                initial_states=init_fp32,
+                                seq_idx=recon_seq_idx,
+                                chunk_indices=recon_chunk_indices,
+                                chunk_offsets=recon_chunk_offsets,
+                                return_varlen_states=False,
+                                return_final_states=True,
+                                dt_softplus=True,
+                                dt_limit=(0.0, float("inf")),
+                                out=recon_out,
+                                state_dtype=torch.float32,
+                            )
 
-                    n_chunks = math.ceil(seq_len / chunk_sz)
-                    recon_device = hidden_states.device
-                    recon_seq_idx = torch.zeros(
-                        (1, seq_len), dtype=torch.int32, device=recon_device
-                    )
-                    recon_chunk_indices = torch.arange(
-                        n_chunks, dtype=torch.int32, device=recon_device
-                    )
-                    recon_chunk_offsets = torch.zeros(
-                        n_chunks, dtype=torch.int32, device=recon_device
-                    )
-                    recon_out = torch.empty_like(h_reshaped)
-                    current_state = ssm_state[cache_idx:cache_idx + 1]
-                    init_fp32 = current_state.to(torch.float32)
-                    final_state = mamba_chunk_scan_combined(
-                        h_reshaped,
-                        dt_reshaped,
-                        self.A,
-                        B_reshaped,
-                        C_reshaped,
-                        chunk_size=chunk_sz,
-                        D=self.D,
-                        z=None,
-                        dt_bias=self.dt_bias,
-                        initial_states=init_fp32,
-                        seq_idx=recon_seq_idx,
-                        chunk_indices=recon_chunk_indices,
-                        chunk_offsets=recon_chunk_offsets,
-                        return_varlen_states=False,
-                        return_final_states=True,
-                        dt_softplus=True,
-                        dt_limit=(0.0, float("inf")),
-                        out=recon_out,
-                        state_dtype=torch.float32,
-                    )
-                    ssm_state[cache_idx] = final_state.squeeze(0).to(ssm_state.dtype)
+                            # Update SSM state with reconstructed state
+                            ssm_state[cache_idx] = final_state.squeeze(0).to(ssm_state.dtype)
 
-                    if initial_states is not None:
-                        initial_states[recon_indices[0]] = ssm_state[cache_idx]
-
-                elif N_recon > 1:
-                    # Batched reconstruction: pack all requests into single varlen call
-                    nheads_tp = self.num_heads // self.tp_size
-                    ngroups_tp = self.n_groups // self.tp_size
-                    total_tokens = sum(deltas)
-                    recon_device = hidden_states.device
-
-                    # Build cu_seqlens for variable-length separation
-                    cu_seqlens = torch.zeros(
-                        N_recon + 1, dtype=torch.int32, device=recon_device
-                    )
-                    for idx in range(N_recon):
-                        cu_seqlens[idx + 1] = cu_seqlens[idx] + deltas[idx]
-
-                    # Pack factors into contiguous flat tensors
-                    h_flat = torch.empty(
-                        (1, total_tokens, nheads_tp, self.head_dim),
-                        dtype=h_list[0].dtype, device=recon_device,
-                    )
-                    dt_flat = torch.empty(
-                        (1, total_tokens, nheads_tp),
-                        dtype=dt_list[0].dtype, device=recon_device,
-                    )
-                    B_flat = torch.empty(
-                        (1, total_tokens, ngroups_tp, B_list[0].shape[-1] // ngroups_tp),
-                        dtype=B_list[0].dtype, device=recon_device,
-                    )
-                    C_flat = torch.empty(
-                        (1, total_tokens, ngroups_tp, C_list[0].shape[-1] // ngroups_tp),
-                        dtype=C_list[0].dtype, device=recon_device,
-                    )
-
-                    offset = 0
-                    for idx in range(N_recon):
-                        d = deltas[idx]
-                        h_flat[0, offset:offset + d] = h_list[idx].view(d, nheads_tp, self.head_dim)
-                        dt_flat[0, offset:offset + d] = dt_list[idx].view(d, nheads_tp)
-                        B_flat[0, offset:offset + d] = B_list[idx].view(d, ngroups_tp, -1)
-                        C_flat[0, offset:offset + d] = C_list[idx].view(d, ngroups_tp, -1)
-                        offset += d
-
-                    # Gather initial states
-                    cache_idx_tensor = torch.tensor(
-                        recon_cache_idxs, dtype=torch.long, device=recon_device
-                    )
-                    recon_initial_states = ssm_state[cache_idx_tensor].to(torch.float32)
-
-                    # Allocate output buffer
-                    recon_out = torch.empty(
-                        (1, total_tokens, nheads_tp, self.head_dim),
-                        dtype=h_flat.dtype, device=recon_device,
-                    )
-
-                    # Single batched call for all requests
-                    varlen_state = mamba_chunk_scan_combined(
-                        h_flat,
-                        dt_flat,
-                        self.A,
-                        B_flat,
-                        C_flat,
-                        chunk_size=chunk_sz,
-                        D=self.D,
-                        z=None,
-                        dt_bias=self.dt_bias,
-                        initial_states=recon_initial_states,
-                        cu_seqlens=cu_seqlens,
-                        return_varlen_states=True,
-                        return_final_states=False,
-                        dt_softplus=True,
-                        dt_limit=(0.0, float("inf")),
-                        out=recon_out,
-                        state_dtype=torch.float32,
-                    )
-
-                    # Scatter results back to SSM state
-                    # varlen_state: [N_recon, nheads, headdim, dstate]
-                    for idx in range(N_recon):
-                        cache_idx = recon_cache_idxs[idx]
-                        ssm_state[cache_idx] = varlen_state[idx].to(ssm_state.dtype)
+                        # Update initial_states if applicable
                         if initial_states is not None:
-                            initial_states[recon_indices[idx]] = ssm_state[cache_idx]
+                            initial_states[i] = ssm_state[cache_idx]
 
             # NOTE: final output is an in-place update of out tensor
             varlen_state = mamba_chunk_scan_combined(
@@ -744,52 +640,20 @@ class MambaMixer2(torch.nn.Module):
 
         # Process decode requests
         if has_decode:
-            is_target_verify = metadata.is_target_verify
-
             # 2. Convolution sequence transformation
-            if is_target_verify:
-                assert (
-                    use_triton_causal_conv
-                ), "Speculative decoding requires use_triton_causal_conv=True for intermediate state support"
-                assert isinstance(
-                    layer_cache, MambaPool.SpeculativeState
-                ), "layer_cache must be SpeculativeState for speculative decoding"
-                draft_token_num = metadata.draft_token_num
-
-                # Reshape for batch processing
-                hidden_states_B_C_d_reshaped = hidden_states_B_C_d.view(
-                    num_decodes, draft_token_num, -1
-                ).transpose(1, 2)
-
-                hidden_states_B_C_d_processed = causal_conv1d_update_triton(
-                    hidden_states_B_C_d_reshaped,
-                    conv_state,
-                    conv_weights,
-                    self.conv1d.bias,
-                    self.activation,
-                    conv_state_indices=state_indices_tensor_d[:num_decodes],
-                    intermediate_conv_window=layer_cache.intermediate_conv_window[0],
-                    retrieve_next_token=metadata.retrieve_next_token,
-                    retrieve_next_sibling=metadata.retrieve_next_sibling,
-                    retrieve_parent_token=metadata.retrieve_parent_token,
-                )
-                hidden_states_B_C_d = hidden_states_B_C_d_processed.transpose(
-                    1, 2
-                ).view(num_decode_tokens, -1)
-            else:
-                ccu = (
-                    causal_conv1d_update
-                    if not use_triton_causal_conv
-                    else causal_conv1d_update_triton
-                )
-                hidden_states_B_C_d = ccu(
-                    hidden_states_B_C_d,
-                    conv_state,
-                    conv_weights,
-                    self.conv1d.bias,
-                    self.activation,
-                    conv_state_indices=state_indices_tensor_d,
-                )
+            ccu = (
+                causal_conv1d_update
+                if not use_triton_causal_conv
+                else causal_conv1d_update_triton
+            )
+            hidden_states_B_C_d = ccu(
+                hidden_states_B_C_d,
+                conv_state,
+                conv_weights,
+                self.conv1d.bias,
+                self.activation,
+                conv_state_indices=state_indices_tensor_d,
+            )
 
             hidden_states_d, B_d, C_d = split_hidden_states_B_C_fn(hidden_states_B_C_d)
 
@@ -809,55 +673,24 @@ class MambaMixer2(torch.nn.Module):
                 -1, self.num_heads // self.tp_size, self.head_dim
             )
 
-            if is_target_verify:
-                selective_state_update(
-                    ssm_state,
-                    hidden_states_d.view(
-                        num_decodes,
-                        draft_token_num,
-                        self.num_heads // self.tp_size,
-                        self.head_dim,
-                    ),
-                    dt_d.view(
-                        num_decodes,
-                        draft_token_num,
-                        self.num_heads // self.tp_size,
-                        self.head_dim,
-                    ),
-                    A_d,
-                    B_d.view(num_decodes, draft_token_num, n_groups, -1),
-                    C_d.view(num_decodes, draft_token_num, n_groups, -1),
-                    D_d,
-                    z=None,
-                    dt_bias=dt_bias,
-                    dt_softplus=True,
-                    state_batch_indices=state_indices_tensor_d[:num_decodes],
-                    out=preallocated_ssm_out_d.view(
-                        num_decodes,
-                        draft_token_num,
-                        self.num_heads // self.tp_size,
-                        self.head_dim,
-                    ),
-                    disable_state_update=True,
-                    intermediate_states_buffer=layer_cache.intermediate_ssm,
-                    cache_steps=draft_token_num,
-                    retrieve_parent_token=metadata.retrieve_parent_token,
-                )
-            else:
-                selective_state_update(
-                    ssm_state,
-                    hidden_states_d,
-                    dt_d,
-                    A_d,
-                    B_d,
-                    C_d,
-                    D_d,
-                    z=None,
-                    dt_bias=dt_bias,
-                    dt_softplus=True,
-                    state_batch_indices=state_indices_tensor_d,
-                    out=preallocated_ssm_out_d.view(num_decodes, -1, self.head_dim),
-                )
+            # - the hidden is reshaped into (bs, num_heads, head_dim)
+            # - layer_state.ssm_state's slots will be selected
+            #   using state_indices_tensor_d
+            # NOTE: final output is an in-place update of out tensor
+            selective_state_update(
+                ssm_state,
+                hidden_states_d,
+                dt_d,
+                A_d,
+                B_d,
+                C_d,
+                D_d,
+                z=None,
+                dt_bias=dt_bias,
+                dt_softplus=True,
+                state_batch_indices=state_indices_tensor_d,
+                out=preallocated_ssm_out_d.view(num_decodes, -1, self.head_dim),
+            )
 
         # 4. gated MLP
         # GatedRMSNorm internally applying SiLU to the gate

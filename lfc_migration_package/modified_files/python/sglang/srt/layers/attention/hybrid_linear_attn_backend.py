@@ -5,7 +5,6 @@ from einops import rearrange
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
-from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.srt.layers.attention.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule_update,
 )
@@ -31,13 +30,14 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.models.qwen3_next import fused_gdn_gating
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import is_cuda, is_npu
 from sglang.srt.utils.catchup_timing import (
     get_timing_collector,
-    is_lfc_enabled,
     is_timing_enabled,
+    is_lfc_enabled,
 )
 
 if is_cuda():
@@ -101,9 +101,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 if forward_batch.spec_info.topk > 1:
                     retrieve_next_token = forward_batch.spec_info.retrive_next_token
                     retrieve_next_sibling = forward_batch.spec_info.retrive_next_sibling
-                    # retrieve_next_token is None during dummy run so skip tensor creation
-                    if retrieve_next_token is not None:
-                        retrieve_parent_token = torch.empty_like(retrieve_next_token)
+                    retrieve_parent_token = torch.empty_like(retrieve_next_token)
             else:
                 query_start_loc = torch.empty(
                     (bs + 1,), dtype=torch.int32, device=self.device
@@ -552,7 +550,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         layer_id = kwargs["layer_id"]
 
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
-        conv_states = layer_cache.conv[0]
+        conv_states = layer_cache.conv
         ssm_states = layer_cache.temporal
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
@@ -635,31 +633,33 @@ class GDNAttnBackend(MambaAttnBackendBase):
         retrieve_parent_token = self.forward_metadata.retrieve_parent_token
 
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer_id)
-        conv_states = mamba_cache_params.conv[0]
+        conv_states = mamba_cache_params.conv
         ssm_states = mamba_cache_params.temporal
         if is_target_verify:
             assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
             intermediate_state_cache = mamba_cache_params.intermediate_ssm
-            intermediate_conv_window_cache = (
-                mamba_cache_params.intermediate_conv_window[0]
-            )
+            intermediate_conv_window_cache = mamba_cache_params.intermediate_conv_window
             has_initial_states = torch.ones(
                 seq_len // forward_batch.spec_info.draft_token_num,
                 dtype=torch.bool,
                 device=forward_batch.input_ids.device,
             )
+            conv_states_to_use = conv_states.clone()
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
+            conv_states_to_use = conv_states
 
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
-            mixed_qkv_reshaped = mixed_qkv.view(
-                batch_size, draft_token_num, -1
-            ).transpose(1, 2)
+            mixed_qkv_reshaped = (
+                mixed_qkv.view(batch_size, draft_token_num, -1)
+                .transpose(1, 2)
+                .contiguous()
+            )
             mixed_qkv_processed = causal_conv1d_update(
                 mixed_qkv_reshaped,
-                conv_states,
+                conv_states_to_use,
                 conv_weights,
                 bias,
                 activation,
@@ -669,14 +669,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_next_sibling=retrieve_next_sibling,
                 retrieve_parent_token=retrieve_parent_token,
             )
-            mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
+            mixed_qkv = (
+                mixed_qkv_processed.transpose(1, 2).contiguous().view(seq_len, -1)
+            )
         else:
             mixed_qkv = causal_conv1d_fn(
                 mixed_qkv.transpose(0, 1),
                 conv_weights,
                 bias,
                 activation=activation,
-                conv_states=conv_states,
+                conv_states=conv_states_to_use,
                 has_initial_state=has_initial_states,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
@@ -700,7 +702,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         key = key.view(1, actual_seq_len, num_heads, head_k_dim)
         value = value.view(1, actual_seq_len, num_value_heads, head_v_dim)
 
-        g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
+        beta = b.sigmoid()
+        g = fused_gdn_gating(A_log, a, dt_bias)
+
+        g = g.unsqueeze(0)
+        beta = beta.unsqueeze(0)
 
         # Get timing collector for LFC instrumentation
         timing_collector = get_timing_collector() if is_timing_enabled() else None
@@ -731,69 +737,41 @@ class GDNAttnBackend(MambaAttnBackendBase):
             if timing_collector:
                 timing_collector.start_phase("catchup_recompute")
 
-            # Cache is_lfc_enabled() on forward_batch to avoid per-layer env lookups
-            if not hasattr(forward_batch, '_lfc_enabled'):
-                forward_batch._lfc_enabled = is_lfc_enabled()
-            lfc_enabled = forward_batch._lfc_enabled
+            lfc_enabled = is_lfc_enabled()
 
             # LFC fast path: apply reconstruction factors from tree node chain if available
             # This reconstructs state from ancestor snapshot + factor chain
             # Supports batch_size > 1 by handling each request individually
-            # Note: Use lfc_reconstruction_factors (tree -> forward) not pending_lfc_factors (forward -> tree)
-            lfc_reconstruction_factors = getattr(forward_batch, "lfc_reconstruction_factors", None)
-            if lfc_enabled and lfc_reconstruction_factors is not None and not getattr(forward_batch, '_lfc_gdn_reconstructed', False):
+            # Note: Use lfc_reconstruction_factors (tree → forward) not pending_lfc_factors (forward → tree)
+            if lfc_enabled and forward_batch.lfc_reconstruction_factors is not None:
+                from sglang.srt.layers.attention.fla.lfc_reconstruct import (
+                    lfc_reconstruct_state,
+                )
                 num_reqs = query_start_loc.shape[0] - 1
-                # Cache .tolist() on forward_batch to avoid per-layer GPU syncs
-                if not hasattr(forward_batch, '_lfc_gdn_cache_indices_list'):
-                    forward_batch._lfc_gdn_cache_indices_list = cache_indices[:num_reqs].tolist()
-                cache_indices_list = forward_batch._lfc_gdn_cache_indices_list
-
-                # Gather all requests needing reconstruction for this layer
-                recon_cache_idxs = []
-                k_list, v_list, g_list, beta_list = [], [], [], []
+                cache_indices_list = cache_indices[:num_reqs].tolist()
                 for i in range(num_reqs):
-                    req_factors = lfc_reconstruction_factors.get(i)
+                    cache_idx = cache_indices_list[i]
+                    # Check if this request has reconstruction factors for this layer
+                    req_factors = forward_batch.lfc_reconstruction_factors.get(i)
                     if req_factors is not None and layer_id in req_factors:
+                        # Factors are pre-merged (concat'd) per layer in match_prefix
                         factors = req_factors[layer_id]
-                        k_f, v_f, g_f, beta_f = factors
-                        recon_cache_idxs.append(cache_indices_list[i])
-                        k_list.append(k_f)
-                        v_list.append(v_f)
-                        g_list.append(g_f)
-                        beta_list.append(beta_f)
+                        k_factors, v_factors, g_factors, beta_factors = factors
+                        snapshot = ssm_states[cache_idx : cache_idx + 1]
 
-                if len(recon_cache_idxs) == 1:
-                    # Single request: use original kernel (no padding overhead)
-                    from sglang.srt.layers.attention.fla.lfc_reconstruct import (
-                        lfc_reconstruct_state,
-                    )
-                    cache_idx = recon_cache_idxs[0]
-                    snapshot = lfc_reconstruct_state(
-                        ssm_states[cache_idx : cache_idx + 1],
-                        k_list[0].unsqueeze(0),
-                        v_list[0].unsqueeze(0),
-                        g_list[0].unsqueeze(0),
-                        beta_list[0].unsqueeze(0),
-                    )
-                    ssm_states[cache_idx] = snapshot.squeeze(0).to(
-                        ssm_states.dtype, copy=False
-                    )
-                elif len(recon_cache_idxs) > 1:
-                    # Batched reconstruction: single kernel for all requests
-                    from sglang.srt.layers.attention.fla.lfc_reconstruct import (
-                        lfc_reconstruct_state_batched,
-                    )
-                    idx_tensor = torch.tensor(
-                        recon_cache_idxs, dtype=torch.long,
-                        device=ssm_states.device,
-                    )
-                    snapshots = ssm_states[idx_tensor]
-                    result = lfc_reconstruct_state_batched(
-                        snapshots, k_list, v_list, g_list, beta_list,
-                    )
-                    ssm_states[idx_tensor] = result.to(
-                        ssm_states.dtype, copy=False
-                    )
+                        # Reshape factors from [delta, H, dim] to [N, delta, H, dim]
+                        # Single kernel call for the entire merged factor chain
+                        snapshot = lfc_reconstruct_state(
+                            snapshot,
+                            k_factors.unsqueeze(0),
+                            v_factors.unsqueeze(0),
+                            g_factors.unsqueeze(0),
+                            beta_factors.unsqueeze(0),
+                        )
+
+                        ssm_states[cache_idx] = snapshot.squeeze(0).to(
+                            ssm_states.dtype, copy=False
+                        )
 
             # Standard path: compute via chunk_gated_delta_rule
             recurrent_state = ssm_states[cache_indices]
@@ -814,49 +792,34 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
             # Store factors for future LFC reconstruction when caching this request
             # Supports batch_size > 1 by handling each request individually
-            reqs = getattr(forward_batch, "reqs", None)
-            if lfc_enabled and reqs is not None:
+            if lfc_enabled and forward_batch.reqs is not None:
                 # key, value: [1, total_tokens, num_heads, head_dim]
-                # g, beta: [1, total_tokens, num_heads] (or similar broadcast shape)
+                # g, beta: [1, total_tokens, num_heads]
                 # query_start_loc format: [0, len_0, len_0+len_1, ...]
-                # Cache .tolist() on forward_batch to avoid per-layer GPU syncs
-                if not hasattr(forward_batch, '_lfc_gdn_start_locs'):
-                    forward_batch._lfc_gdn_start_locs = query_start_loc[:len(reqs) + 1].tolist()
-                start_locs = forward_batch._lfc_gdn_start_locs
+                start_locs = query_start_loc[:len(forward_batch.reqs) + 1].tolist()
+                for i, req in enumerate(forward_batch.reqs):
+                    if not getattr(req, '_needs_factor_capture', False):
+                        continue
+                    start_idx = start_locs[i]
+                    end_idx = start_locs[i + 1]
+                    factor_seq_len = end_idx - start_idx
 
-                # Batch factor capture: clone full tensors once, then split
-                # into per-request views (4 clones total instead of B*4)
-                capture_indices = [i for i, req in enumerate(reqs)
-                                   if getattr(req, '_needs_factor_capture', False)]
-
-                if capture_indices:
-                    total_offset = start_locs[0]
-                    total_end = start_locs[-1]
-                    total_len = total_end - total_offset
-
-                    if total_len > 0:
-                        # 4 batch clones instead of B*4 individual clones
-                        k_batch = key[0, total_offset:total_end].clone()
-                        v_batch = value[0, total_offset:total_end].clone()
-                        g_batch = g[0, total_offset:total_end].clone()
-                        b_batch = beta[0, total_offset:total_end].clone()
-
-                        # Zero-cost split into per-request views
-                        seq_lens = [start_locs[i + 1] - start_locs[i] for i in range(len(reqs))]
-                        k_splits = k_batch.split(seq_lens)
-                        v_splits = v_batch.split(seq_lens)
-                        g_splits = g_batch.split(seq_lens)
-                        b_splits = b_batch.split(seq_lens)
-
-                        for i in capture_indices:
-                            if seq_lens[i] > 0:
-                                req = reqs[i]
-                                if req.pending_lfc_factors is None:
-                                    req.pending_lfc_factors = {}
-                                req.pending_lfc_factors[layer_id] = (
-                                    k_splits[i], v_splits[i],
-                                    g_splits[i], b_splits[i],
-                                )
+                    if factor_seq_len > 0:
+                        # Store factors on the request for later attachment to tree node
+                        if not hasattr(req, "pending_lfc_factors") or req.pending_lfc_factors is None:
+                            req.pending_lfc_factors = {}
+                        # Store factors for this layer
+                        # Use explicit indexing for clarity: key shape [1, total_tokens, H, D]
+                        k_factors = key[0, start_idx:end_idx].clone()  # [num_tokens, H, D]
+                        v_factors = value[0, start_idx:end_idx].clone()  # [num_tokens, H, D]
+                        g_factors = g[0, start_idx:end_idx].clone()  # [num_tokens, H]
+                        beta_factors = beta[0, start_idx:end_idx].clone()  # [num_tokens, H]
+                        req.pending_lfc_factors[layer_id] = (
+                            k_factors,
+                            v_factors,
+                            g_factors,
+                            beta_factors,
+                        )
 
             if timing_collector:
                 timing_collector.end_phase("catchup_recompute")
@@ -876,7 +839,8 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         metadata = self._forward_metadata(forward_batch)
         self.forward_metadata = Mamba2Metadata.prepare_mixed(
-            metadata,
+            metadata.query_start_loc,
+            metadata.mamba_cache_indices,
             self.mamba_chunk_size,
             forward_batch,
         )
@@ -892,12 +856,8 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
         metadata = self._capture_metadata(bs, req_pool_indices, forward_mode, spec_info)
-        draft_token_num = spec_info.draft_token_num if spec_info is not None else 1
         self.forward_metadata = Mamba2Metadata.prepare_decode(
-            metadata,
-            seq_lens,
-            is_target_verify=forward_mode.is_target_verify(),
-            draft_token_num=draft_token_num,
+            metadata.query_start_loc, metadata.mamba_cache_indices, seq_lens
         )
 
     def init_forward_metadata_replay_cuda_graph(
@@ -914,12 +874,8 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         metadata = self._replay_metadata(
             bs, req_pool_indices, forward_mode, spec_info, seq_lens_cpu
         )
-        draft_token_num = spec_info.draft_token_num if spec_info is not None else 1
         self.forward_metadata = Mamba2Metadata.prepare_decode(
-            metadata,
-            seq_lens,
-            is_target_verify=forward_mode.is_target_verify(),
-            draft_token_num=draft_token_num,
+            metadata.query_start_loc, metadata.mamba_cache_indices, seq_lens
         )
 
     def forward(
@@ -928,7 +884,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         hidden_states: torch.Tensor,
         output: torch.Tensor,
         layer_id: int,
-        forward_batch=None,
+        forward_batch: ForwardBatch = None,
         mup_vector: Optional[torch.Tensor] = None,
         use_triton_causal_conv: bool = False,
     ):
@@ -1112,10 +1068,10 @@ class HybridLinearAttnBackend(AttentionBackend):
             self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
         )
 
-        conv_states = mamba_caches.conv[0]
+        conv_states = mamba_caches.conv
         ssm_states = mamba_caches.temporal
         intermediate_state_cache = mamba_caches.intermediate_ssm
-        intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
+        intermediate_conv_window_cache = mamba_caches.intermediate_conv_window
 
         # SSM state updates (chunked to reduce peak memory)
         valid_mask = accepted_indices >= 0

@@ -10,9 +10,19 @@ class UsageProcessor:
     """Stateless helpers that turn raw token counts into a UsageInfo."""
 
     @staticmethod
-    def _details_if_cached(count: int) -> Optional[Dict[str, int]]:
-        """Return {"cached_tokens": N} only when N > 0 (keeps JSON slim)."""
-        return {"cached_tokens": count} if count > 0 else None
+    def _build_cached_details(
+        cached_total: int,
+        attn_total: int = 0,
+        mamba_total: int = 0,
+    ) -> Optional[Dict[str, int]]:
+        """Build prompt_tokens_details dict, omitting zero-only results."""
+        details: Dict[str, int] = {}
+        if cached_total > 0:
+            details["cached_tokens"] = cached_total
+        if attn_total > 0 or mamba_total > 0:
+            details["attn_potential_hit_tokens"] = attn_total
+            details["mamba_hit_tokens"] = mamba_total
+        return details if details else None
 
     @staticmethod
     def calculate_response_usage(
@@ -33,7 +43,17 @@ class UsageProcessor:
                 responses[i]["meta_info"].get("cached_tokens", 0)
                 for i in range(0, len(responses), n_choices)
             )
-            cached_details = UsageProcessor._details_if_cached(cached_total)
+            attn_total = sum(
+                responses[i]["meta_info"].get("attn_potential_hit_tokens", 0)
+                for i in range(0, len(responses), n_choices)
+            )
+            mamba_total = sum(
+                responses[i]["meta_info"].get("mamba_hit_tokens", 0)
+                for i in range(0, len(responses), n_choices)
+            )
+            cached_details = UsageProcessor._build_cached_details(
+                cached_total, attn_total, mamba_total
+            )
 
         return UsageProcessor.calculate_token_usage(
             prompt_tokens=prompt_tokens,
@@ -46,6 +66,8 @@ class UsageProcessor:
         prompt_tokens: Mapping[int, int],
         completion_tokens: Mapping[int, int],
         cached_tokens: Mapping[int, int],
+        attn_potential_hit_tokens: Mapping[int, int],
+        mamba_hit_tokens: Mapping[int, int],
         n_choices: int,
         enable_cache_report: bool = False,
     ) -> UsageInfo:
@@ -55,13 +77,21 @@ class UsageProcessor:
         )
         total_completion_tokens = sum(completion_tokens.values())
 
-        cached_details = (
-            UsageProcessor._details_if_cached(
-                sum(tok for idx, tok in cached_tokens.items() if idx % n_choices == 0)
+        cached_details = None
+        if enable_cache_report:
+            cached_details = UsageProcessor._build_cached_details(
+                sum(tok for idx, tok in cached_tokens.items() if idx % n_choices == 0),
+                sum(
+                    tok
+                    for idx, tok in attn_potential_hit_tokens.items()
+                    if idx % n_choices == 0
+                ),
+                sum(
+                    tok
+                    for idx, tok in mamba_hit_tokens.items()
+                    if idx % n_choices == 0
+                ),
             )
-            if enable_cache_report
-            else None
-        )
 
         return UsageProcessor.calculate_token_usage(
             prompt_tokens=total_prompt_tokens,

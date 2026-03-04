@@ -26,18 +26,19 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 from numpy import float64
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
     _key_match_page_size1,
     get_child_key,
 )
-from sglang.srt.utils.catchup_timing import is_lfc_enabled
+from sglang.srt.utils.catchup_timing import get_timing_collector, is_timing_enabled
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
-    from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 
 import logging
 
@@ -324,24 +325,25 @@ class LRUList:
 
 
 class MambaRadixCache(BasePrefixCache):
-    def __init__(self, params: CacheInitParams):
-        assert isinstance(params.token_to_kv_pool_allocator, TokenToKVPoolAllocator)
-        self.req_to_token_pool = params.req_to_token_pool
-        self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
+    def __init__(
+        self,
+        req_to_token_pool: HybridReqToTokenPool,
+        token_to_kv_pool_allocator: TokenToKVPoolAllocator,
+        page_size: int,
+        disable: bool = False,
+    ):
+        assert isinstance(token_to_kv_pool_allocator, TokenToKVPoolAllocator)
+        self.req_to_token_pool = req_to_token_pool
+        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
 
-        assert (
-            params.page_size == 1
-        ), "Only support page_size=1 in mamba radix cache now."
-        self.page_size = params.page_size
-        self.disable = params.disable
+        assert page_size == 1, "Only support page_size=1 in mamba radix cache now."
+        self.page_size = page_size
+        self.disable = disable
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
         else:
             self.device = torch.device("cpu")
-
-        if params.enable_metrics:
-            self.init_metrics_collector()
 
         self.key_match_fn = _key_match_page_size1
         self.get_child_key_fn = get_child_key
@@ -363,17 +365,14 @@ class MambaRadixCache(BasePrefixCache):
         self.full_lru_list = LRUList(mamba=False)
         self.mamba_lru_list = LRUList(mamba=True)
 
-        # LFC memory budget management (only active when LFC is enabled)
-        if is_lfc_enabled():
-            from sglang.srt.environ import envs
-
-            budget_gb = envs.SGLANG_LFC_MEMORY_BUDGET_GB.value
-            self.lfc_memory_budget_bytes = int(budget_gb * 1024**3)
-            self.lfc_current_memory_bytes = 0
-            # Min-heap of (factor_value, node_id, node_ref) for eviction
-            self.lfc_factor_heap: list = []
-            # Map node_id -> bool for quick heap validity check (lazy deletion)
-            self.lfc_factor_nodes: dict = {}
+        # LFC memory budget management
+        budget_gb = envs.SGLANG_LFC_MEMORY_BUDGET_GB.value
+        self.lfc_memory_budget_bytes = int(budget_gb * 1024**3)
+        self.lfc_current_memory_bytes = 0
+        # Min-heap of (factor_value, node_id, node_ref) for eviction
+        self.lfc_factor_heap: list = []
+        # Map node_id -> bool for quick heap validity check (lazy deletion)
+        self.lfc_factor_nodes: dict = {}
 
     def match_prefix(self, key: RadixKey, **kwargs) -> MatchResult:
         """Find the matching prefix from the radix tree.
@@ -389,6 +388,9 @@ class MambaRadixCache(BasePrefixCache):
         cow_mamba: bool = kwargs.get("cow_mamba", False)
         req: Req = kwargs.get("req", None)
 
+        # Get timing collector if enabled
+        timing_collector = get_timing_collector() if is_timing_enabled() else None
+
         if self.disable or len(key) == 0:
             return MatchResult(
                 device_indices=torch.empty(
@@ -400,31 +402,21 @@ class MambaRadixCache(BasePrefixCache):
                 last_host_node=self.root_node,
             )
 
-        value, last_node, attn_match_len = self._match_prefix_helper(key)
+        # Time prefix matching phase
+        if timing_collector:
+            timing_collector.start_phase("prefix_match")
 
-        # Instrumentation: log match_prefix decisions
-        if cow_mamba and req is not None:
-            matched_tokens = sum(len(v) for v in value) if value else 0
-            has_mamba = last_node.mamba_value is not None
-            has_lfc = getattr(last_node, 'lfc_factors', None) is not None
-            lfc_on = is_lfc_enabled()
-            node_key_len = len(last_node.key) if hasattr(last_node, 'key') else -1
-            n_children = len(last_node.children) if hasattr(last_node, 'children') else -1
-            is_leaf = (n_children == 0)
-            if matched_tokens > 0 or attn_match_len > 0:
-                logger.warning(
-                    f"[LFC-TRACE] match_prefix: matched={matched_tokens}, "
-                    f"attn_match={attn_match_len}, "
-                    f"mamba={'Y' if has_mamba else 'N'}, "
-                    f"lfc={'Y' if has_lfc else 'N'}, "
-                    f"lfc_on={lfc_on}, "
-                    f"nid={last_node.id}, "
-                    f"key_len={node_key_len}, children={n_children}, "
-                    f"leaf={is_leaf}"
-                )
+        value, last_node = self._match_prefix_helper(key)
+
+        if timing_collector:
+            timing_collector.end_phase("prefix_match")
 
         # copy mamba state to req local space if cow is true
         if cow_mamba and last_node.mamba_value is not None:
+            # Time SSM state load phase
+            if timing_collector:
+                timing_collector.start_phase("ssm_state_load")
+
             # for reqs without mamba cache
             if req.mamba_pool_idx is None:
                 dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
@@ -443,8 +435,14 @@ class MambaRadixCache(BasePrefixCache):
                 dst_index = req.mamba_pool_idx.unsqueeze(0)
                 self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
 
-        elif cow_mamba and is_lfc_enabled() and last_node.lfc_factors is not None:
+            if timing_collector:
+                timing_collector.end_phase("ssm_state_load")
+
+        elif cow_mamba and last_node.lfc_factors is not None:
             # LFC path: reconstruct SSM state from ancestor + factor chain
+            if timing_collector:
+                timing_collector.start_phase("lfc_reconstruction")
+
             # 1. Walk up to nearest ancestor with full SSM state (or root)
             ancestor = last_node.parent
             factor_chain = [last_node]
@@ -488,7 +486,7 @@ class MambaRadixCache(BasePrefixCache):
             # 4. Store reconstruction factors on request for use during forward
             # The reconstruction will happen in forward_extend where we have access to
             # the layer-specific state. We pass the factor chain to the request.
-            # Note: Use lfc_reconstruction_factors (tree -> forward) not pending_lfc_factors (forward -> tree)
+            # Note: Use lfc_reconstruction_factors (tree → forward) not pending_lfc_factors (forward → tree)
             # Pre-merge: collect factor chunks per layer, then concat into single tensors
             # so that each layer only needs one kernel call during reconstruction.
             layer_chunks = {}
@@ -504,24 +502,14 @@ class MambaRadixCache(BasePrefixCache):
                 if len(chunk_list) == 1:
                     req.lfc_reconstruction_factors[layer_id] = chunk_list[0]
                 else:
-                    # Single allocation + indexed copy (avoids torch.cat's per-call
-                    # dispatch overhead and internal temporary allocation)
-                    num_factors = len(chunk_list[0])
-                    result = []
-                    for j in range(num_factors):
-                        total_tokens = sum(c[j].shape[0] for c in chunk_list)
-                        ref = chunk_list[0][j]
-                        buf = torch.empty(
-                            (total_tokens, *ref.shape[1:]),
-                            dtype=ref.dtype, device=ref.device,
-                        )
-                        offset = 0
-                        for c in chunk_list:
-                            n = c[j].shape[0]
-                            buf[offset:offset + n] = c[j]
-                            offset += n
-                        result.append(buf)
-                    req.lfc_reconstruction_factors[layer_id] = tuple(result)
+                    # Concat all chunks along the sequence (time) dimension
+                    req.lfc_reconstruction_factors[layer_id] = tuple(
+                        torch.cat([c[j] for c in chunk_list], dim=0)
+                        for j in range(len(chunk_list[0]))
+                    )
+
+            if timing_collector:
+                timing_collector.end_phase("lfc_reconstruction")
 
         if value:
             value = torch.cat(value)
@@ -532,7 +520,6 @@ class MambaRadixCache(BasePrefixCache):
             device_indices=value,
             last_device_node=last_node,
             last_host_node=last_node,
-            mamba_branching_seqlen=attn_match_len,
         )
 
     def insert(
@@ -543,25 +530,22 @@ class MambaRadixCache(BasePrefixCache):
 
         if value is None:
             value = torch.tensor([x for x in key.token_ids], dtype=torch.int64)
-        return self._insert_helper(
-            self.root_node, key, value, mamba_value, lfc_factors
-        )
+        return self._insert_helper(self.root_node, key, value, mamba_value, lfc_factors)
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True):
+    def cache_finished_req(self, req: Req, is_insert=True) -> None:
         """Cache request when it finishes."""
-        kv_committed_len = req.pop_committed_kv_cache()
-
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :kv_committed_len
+                req.req_pool_idx,
+                : len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0),
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
             self.req_to_token_pool.free(req.req_pool_idx)
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+        token_ids = (req.origin_input_ids + req.output_ids)[:-1]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_committed_len
+            req.req_pool_idx, : len(token_ids)
         ]
 
         page_aligned_len = len(kv_indices)
@@ -570,15 +554,15 @@ class MambaRadixCache(BasePrefixCache):
         # Radix Cache takes one ref in memory pool
         # insert the token_ids and kv_indices into the radix tree
         # Note: the insert function already frees the overlapped kv_indices
-        mamba_value = req.mamba_pool_idx.unsqueeze(-1).clone()
+        mamba_value = (
+            self.req_to_token_pool.get_mamba_indices(req.req_pool_idx)
+            .unsqueeze(-1)
+            .clone()
+        )
 
         if is_insert:
-            # Get pending LFC factors from request if available (LFC-only)
-            lfc_factors = (
-                getattr(req, "pending_lfc_factors", None)
-                if is_lfc_enabled()
-                else None
-            )
+            # Get pending LFC factors from request if available
+            lfc_factors = getattr(req, "pending_lfc_factors", None)
             new_prefix_len, mamba_exist = self.insert(
                 RadixKey(token_ids[:page_aligned_len], req.extra_key),
                 page_aligned_kv_indices,
@@ -594,11 +578,8 @@ class MambaRadixCache(BasePrefixCache):
             )
             mamba_exist = True
 
-        if req.req_pool_idx is not None:
-            self.req_to_token_pool.free(req.req_pool_idx, free_mamba_cache=mamba_exist)
-            self.dec_lock_ref(req.last_node)
-        else:  # for abort case
-            self.req_to_token_pool.mamba_pool.free(mamba_value)
+        self.req_to_token_pool.free(req.req_pool_idx, free_mamba_cache=mamba_exist)
+        self.dec_lock_ref(req.last_node)
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
@@ -631,12 +612,8 @@ class MambaRadixCache(BasePrefixCache):
                 mamba_value
             )
             assert mamba_value_forked is not None, "Can not alloc mamba cache"
-        # Get pending LFC factors from request if available (LFC-only)
-        lfc_factors = (
-            getattr(req, "pending_lfc_factors", None)
-            if is_lfc_enabled()
-            else None
-        )
+        # Get pending LFC factors from request if available
+        lfc_factors = getattr(req, "pending_lfc_factors", None)
         new_prefix_len, mamba_exist = self.insert(
             RadixKey(page_aligned_token_ids, req.extra_key),
             page_aligned_kv_indices,
@@ -651,12 +628,8 @@ class MambaRadixCache(BasePrefixCache):
             self.req_to_token_pool.mamba_pool.free(mamba_value_forked)
 
         # The prefix indices could be updated, reuse it
-        match_result = self.match_prefix(
+        new_indices, new_last_node, _, _ = self.match_prefix(
             RadixKey(page_aligned_token_ids, req.extra_key)
-        )
-        (new_indices, new_last_node) = (
-            match_result.device_indices,
-            match_result.last_device_node,
         )
 
         if not mamba_exist:
@@ -889,21 +862,15 @@ class MambaRadixCache(BasePrefixCache):
 
         Higher value = more useful to keep.
         Formula: hit_count * num_children / len(node.key)
-        Internal nodes (with children) get massive bonus to prevent chain breaks.
         """
         key_len = len(node.key) if node.key else 1
         num_children = len(node.children)
-        base_value = node.hit_count * max(num_children, 1) / key_len
-        # Internal nodes are chain-critical — near-infinite eviction protection
-        if num_children > 0:
-            base_value += 1e6
-        return base_value
+        return node.hit_count * max(num_children, 1) / key_len
 
     def _lfc_try_store_factors(self, node: TreeNode, lfc_factors: dict) -> bool:
         """Try to store LFC factors on a node, respecting memory budget.
 
         Returns True if factors were stored, False if rejected.
-        Only called when LFC is enabled.
         """
         if lfc_factors is None:
             return False
@@ -936,14 +903,9 @@ class MambaRadixCache(BasePrefixCache):
                 heapq.heappop(self.lfc_factor_heap)
                 continue
 
-            # Skip internal nodes — their factors are chain-critical
-            if len(min_node.children) > 0:
-                heapq.heappop(self.lfc_factor_heap)
-                continue
-
             # New node isn't more valuable than what we'd evict
             if new_value <= min_value:
-                break
+                return False
 
             # Evict the lowest-value node's factors
             heapq.heappop(self.lfc_factor_heap)
@@ -963,22 +925,10 @@ class MambaRadixCache(BasePrefixCache):
             self.lfc_factor_nodes[node.id] = True
             return True
 
-        # Last resort: force-store for internal nodes to prevent chain gaps
-        if len(node.children) > 0:
-            node.lfc_factors = lfc_factors
-            self.lfc_current_memory_bytes += factor_bytes
-            factor_value = self._compute_factor_value(node)
-            heapq.heappush(self.lfc_factor_heap, (factor_value, node.id, node))
-            self.lfc_factor_nodes[node.id] = True
-            return True
-
         return False
 
     def _lfc_remove_factors(self, node: TreeNode):
-        """Remove LFC factors from a node and update memory tracking.
-
-        Only called when LFC is enabled.
-        """
+        """Remove LFC factors from a node and update memory tracking."""
         if node.lfc_factors is not None:
             factor_bytes = self._estimate_factor_memory(node.lfc_factors)
             self.lfc_current_memory_bytes -= factor_bytes
@@ -989,15 +939,15 @@ class MambaRadixCache(BasePrefixCache):
 
     def _match_prefix_helper(
         self, key: RadixKey
-    ) -> Tuple[List[torch.Tensor], TreeNode, int]:
+    ) -> Tuple[List[torch.Tensor], TreeNode]:
         """
         Mamba prefix matching helper. It factors in the sliding window size such that
         the matched node is guaranteed to either 1. connected to root without mamba tombstone,
         or 2. the number of matching tokens from the matched node to the last mamba tombstone
         node is greater than or equal to the sliding window size.
 
-        LFC Enhancement: When LFC is enabled, tracks factor chain validity to detect
-        gap nodes. A gap node (no mamba_value, no lfc_factors) breaks the factor chain,
+        LFC Enhancement: Tracks factor chain validity to detect gap nodes.
+        A gap node (no mamba_value, no lfc_factors) breaks the factor chain,
         preventing LFC reconstruction for nodes beyond the gap.
         """
         node = self.root_node
@@ -1007,7 +957,6 @@ class MambaRadixCache(BasePrefixCache):
         best_value_len = 0
         best_last_node = node
         # LFC: Track if factor chain is unbroken from last mamba_value node
-        lfc_enabled = is_lfc_enabled()
         lfc_chain_valid = True
 
         while len(key) > 0 and child_key in node.children.keys():
@@ -1018,21 +967,14 @@ class MambaRadixCache(BasePrefixCache):
                 # Has full SSM state: unconditionally accept and reset chain
                 best_value_len = len(value)
                 best_last_node = node
-                if lfc_enabled:
-                    lfc_chain_valid = True  # Reset chain validity
-            elif lfc_enabled and node.lfc_factors is not None and lfc_chain_valid:
+                lfc_chain_valid = True  # Reset chain validity
+            elif node.lfc_factors is not None and lfc_chain_valid:
                 # Has LFC factors AND chain is still valid: accept
                 best_value_len = len(value)
                 best_last_node = node
-            elif (
-                lfc_enabled
-                and node.lfc_factors is None
-                and node.mamba_value is None
-                and node != self.root_node
-            ):
+            elif node.lfc_factors is None and node.mamba_value is None and node != self.root_node:
                 # Gap node (no mamba_value, no lfc_factors): chain breaks
                 lfc_chain_valid = False
-                logger.debug(f"[LFC-GAP] Chain broken at node {node.id}, key_len={len(node.key)}, children={len(node.children)}")
                 # Do NOT update best_last_node - stop accepting LFC nodes
 
             prefix_len = self.key_match_fn(child.key, key)
@@ -1053,7 +995,7 @@ class MambaRadixCache(BasePrefixCache):
         if node.mamba_value is not None:
             best_value_len = len(value)
             best_last_node = node
-        elif lfc_enabled and node.lfc_factors is not None and lfc_chain_valid:
+        elif node.lfc_factors is not None and lfc_chain_valid:
             best_value_len = len(value)
             best_last_node = node
 
@@ -1072,9 +1014,7 @@ class MambaRadixCache(BasePrefixCache):
             )
             node_update = node_update.parent
 
-        # Total key-matched tokens (attention-reusable) regardless of mamba_value
-        attn_match_len = sum(len(v) for v in value)
-        return value[:best_value_len], best_last_node, attn_match_len
+        return value[:best_value_len], best_last_node
 
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int) -> TreeNode:
         # new_node -> child
@@ -1090,7 +1030,7 @@ class MambaRadixCache(BasePrefixCache):
         # LFC Enhancement: Split lfc_factors if present
         # new_node gets factors for tokens [0:split_len]
         # child keeps factors for tokens [split_len:]
-        if is_lfc_enabled() and child.lfc_factors is not None:
+        if child.lfc_factors is not None:
             # Remove old child from memory tracking before split
             old_bytes = self._estimate_factor_memory(child.lfc_factors)
             if child.id in self.lfc_factor_nodes:
@@ -1099,14 +1039,11 @@ class MambaRadixCache(BasePrefixCache):
             new_node.lfc_factors = {}
             for layer_id, (k, v, g, beta) in child.lfc_factors.items():
                 # Factors are stored as [seq_len, ...], split by token index
-                # new_node (prefix) gets views into the original tensors (no alloc);
-                # child (suffix) gets clones so it's independent.
-                # The original tensor stays alive via new_node's views until evicted.
                 new_node.lfc_factors[layer_id] = (
-                    k[:split_len],
-                    v[:split_len],
-                    g[:split_len],
-                    beta[:split_len],
+                    k[:split_len].clone(),
+                    v[:split_len].clone(),
+                    g[:split_len].clone(),
+                    beta[:split_len].clone(),
                 )
                 child.lfc_factors[layer_id] = (
                     k[split_len:].clone(),
@@ -1195,8 +1132,8 @@ class MambaRadixCache(BasePrefixCache):
             new_node.key = key
             new_node.value = value
             new_node.mamba_value = mamba_value
-            # Attach LFC factors with memory budget check (LFC-only)
-            if is_lfc_enabled() and lfc_factors is not None:
+            # Attach LFC factors with memory budget check
+            if lfc_factors is not None:
                 self._lfc_try_store_factors(new_node, lfc_factors)
             self.full_lru_list.insert_mru(new_node)
             self.mamba_lru_list.insert_mru(new_node)
@@ -1205,8 +1142,8 @@ class MambaRadixCache(BasePrefixCache):
             self.mamba_evictable_size_ += len(mamba_value)
         elif node.mamba_value is None:  # add for mamba tombstone
             node.mamba_value = mamba_value
-            # Attach LFC factors with memory budget check (LFC-only)
-            if is_lfc_enabled() and lfc_factors is not None:
+            # Attach LFC factors with memory budget check
+            if lfc_factors is not None:
                 self._lfc_try_store_factors(node, lfc_factors)
             self.full_lru_list.reset_node_mru(node)
             self.mamba_lru_list.insert_mru(node)
@@ -1214,9 +1151,6 @@ class MambaRadixCache(BasePrefixCache):
             node.last_access_time = get_last_access_time()
         else:  # mamba value already exists
             mamba_value_exist = True
-            # Opportunistically store LFC factors if missing
-            if is_lfc_enabled() and lfc_factors is not None and node.lfc_factors is None:
-                self._lfc_try_store_factors(node, lfc_factors)
             self.full_lru_list.reset_node_mru(node)
             self.mamba_lru_list.reset_node_mru(node)
             node.last_access_time = get_last_access_time()
@@ -1252,12 +1186,11 @@ class MambaRadixCache(BasePrefixCache):
         ), f"Invariant violated: leaf node is a tombstone, {node.id=}"
         assert len(node.children) == 0, f"leaf node has children, {node.id=}"
         # Clean up LFC factor memory tracking
-        if is_lfc_enabled():
-            self._lfc_remove_factors(node)
-        key = self.get_child_key_fn(node.key)
-        v = node.parent.children.pop(key, None)
-        assert v == node, f"parent does not have child key, {key}"
-
+        self._lfc_remove_factors(node)
+        for k, v in node.parent.children.items():
+            if v == node:
+                break
+        del node.parent.children[k]
         self.full_evictable_size_ -= len(node.key)
         self.mamba_evictable_size_ -= len(node.mamba_value)
 
@@ -1274,12 +1207,11 @@ class MambaRadixCache(BasePrefixCache):
         ), f"Deleting a unexpected non-tombstone leaf node, {node.id=}"
         assert len(node.children) == 0, f"leaf node has children, {node.id=}"
         # Clean up LFC factor memory tracking
-        if is_lfc_enabled():
-            self._lfc_remove_factors(node)
-        key = self.get_child_key_fn(node.key)
-        v = node.parent.children.pop(key, None)
-        assert v == node, f"parent does not have child key, {key}"
-
+        self._lfc_remove_factors(node)
+        for k, v in node.parent.children.items():
+            if v == node:
+                break
+        del node.parent.children[k]
         self.full_evictable_size_ -= len(node.key)
 
     def _collect_leaves(self) -> List[TreeNode]:

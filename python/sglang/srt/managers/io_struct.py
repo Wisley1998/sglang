@@ -922,6 +922,8 @@ class BatchTokenIDOutput(
     prompt_tokens: List[int]
     completion_tokens: List[int]
     cached_tokens: List[int]
+    attn_potential_hit_tokens: List[int]
+    mamba_hit_tokens: List[int]
 
     # Logprobs
     input_token_logprobs_val: List[float]
@@ -1001,6 +1003,8 @@ class BatchStrOutput(
     prompt_tokens: List[int]
     completion_tokens: List[int]
     cached_tokens: List[int]
+    attn_potential_hit_tokens: List[int]
+    mamba_hit_tokens: List[int]
 
     # Logprobs
     input_token_logprobs_val: List[float]
@@ -1051,6 +1055,8 @@ class BatchMultimodalOutput(BaseBatchReq):
     prompt_tokens: List[int]
     completion_tokens: List[int]
     cached_tokens: List[int]
+    attn_potential_hit_tokens: List[int]
+    mamba_hit_tokens: List[int]
 
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
@@ -1067,6 +1073,8 @@ class BatchEmbeddingOutput(BaseBatchReq, RequestTimingMetricsMixin):
     # Token counts
     prompt_tokens: List[int]
     cached_tokens: List[int]
+    attn_potential_hit_tokens: List[int]
+    mamba_hit_tokens: List[int]
     # Placeholder token info
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]

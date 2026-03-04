@@ -1,0 +1,1201 @@
+diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
+index fc0e3ef71..029187e3d 100644
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -281,6 +281,14 @@ class Envs:
+     # Tool-Call behavior
+     SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
+ 
++    # LFC (Linear Factor Caching) catch-up timing instrumentation
++    SGLANG_CATCHUP_TIMING = EnvBool(False)  # Enable timing collection
++    SGLANG_CATCHUP_TIMING_DIR = EnvStr("/tmp/sglang_catchup")  # Output directory
++    SGLANG_LFC_ENABLED = EnvBool(False)  # Enable LFC mode
++    SGLANG_SNAPSHOT_INTERVAL = EnvInt(500)  # K value for snapshot interval
++    SGLANG_LFC_MEMORY_BUDGET_GB = EnvFloat(2.0)  # GPU memory budget for LFC factors
++    SGLANG_FORCE_RADIX_CACHE = EnvBool(False)  # Force radix cache ON for Mamba models (benchmarking)
++
+     # fmt: on
+ 
+ 
+diff --git a/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py b/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
+index 016b803ff..1c2017c29 100644
+--- a/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
++++ b/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
+@@ -34,6 +34,11 @@ from sglang.srt.models.qwen3_next import fused_gdn_gating
+ from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+ from sglang.srt.speculative.spec_info import SpecInput
+ from sglang.srt.utils import is_cuda, is_npu
++from sglang.srt.utils.catchup_timing import (
++    get_timing_collector,
++    is_timing_enabled,
++    is_lfc_enabled,
++)
+ 
+ if is_cuda():
+     from sglang.srt.layers.attention.mamba.causal_conv1d import (
+@@ -703,7 +708,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
+         g = g.unsqueeze(0)
+         beta = beta.unsqueeze(0)
+ 
++        # Get timing collector for LFC instrumentation
++        timing_collector = get_timing_collector() if is_timing_enabled() else None
++
+         if is_target_verify:
++            if timing_collector:
++                timing_collector.start_phase("catchup_recompute")
++
+             core_attn_out = fused_recurrent_gated_delta_rule_update(
+                 q=query,
+                 k=key,
+@@ -719,7 +730,50 @@ class GDNAttnBackend(MambaAttnBackendBase):
+                 cache_steps=forward_batch.spec_info.draft_token_num,
+                 retrieve_parent_token=retrieve_parent_token,
+             )
++
++            if timing_collector:
++                timing_collector.end_phase("catchup_recompute")
+         else:
++            if timing_collector:
++                timing_collector.start_phase("catchup_recompute")
++
++            lfc_enabled = is_lfc_enabled()
++
++            # LFC fast path: apply reconstruction factors from tree node chain if available
++            # This reconstructs state from ancestor snapshot + factor chain
++            # Supports batch_size > 1 by handling each request individually
++            # Note: Use lfc_reconstruction_factors (tree → forward) not pending_lfc_factors (forward → tree)
++            if lfc_enabled and forward_batch.lfc_reconstruction_factors is not None:
++                from sglang.srt.layers.attention.fla.lfc_reconstruct import (
++                    lfc_reconstruct_state,
++                )
++                num_reqs = query_start_loc.shape[0] - 1
++                cache_indices_list = cache_indices[:num_reqs].tolist()
++                for i in range(num_reqs):
++                    cache_idx = cache_indices_list[i]
++                    # Check if this request has reconstruction factors for this layer
++                    req_factors = forward_batch.lfc_reconstruction_factors.get(i)
++                    if req_factors is not None and layer_id in req_factors:
++                        # Factors are pre-merged (concat'd) per layer in match_prefix
++                        factors = req_factors[layer_id]
++                        k_factors, v_factors, g_factors, beta_factors = factors
++                        snapshot = ssm_states[cache_idx : cache_idx + 1]
++
++                        # Reshape factors from [delta, H, dim] to [N, delta, H, dim]
++                        # Single kernel call for the entire merged factor chain
++                        snapshot = lfc_reconstruct_state(
++                            snapshot,
++                            k_factors.unsqueeze(0),
++                            v_factors.unsqueeze(0),
++                            g_factors.unsqueeze(0),
++                            beta_factors.unsqueeze(0),
++                        )
++
++                        ssm_states[cache_idx] = snapshot.squeeze(0).to(
++                            ssm_states.dtype, copy=False
++                        )
++
++            # Standard path: compute via chunk_gated_delta_rule
+             recurrent_state = ssm_states[cache_indices]
+             core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
+                 q=query,
+@@ -736,6 +790,40 @@ class GDNAttnBackend(MambaAttnBackendBase):
+             last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
+             ssm_states[cache_indices] = last_recurrent_state
+ 
++            # Store factors for future LFC reconstruction when caching this request
++            # Supports batch_size > 1 by handling each request individually
++            if lfc_enabled and forward_batch.reqs is not None:
++                # key, value: [1, total_tokens, num_heads, head_dim]
++                # g, beta: [1, total_tokens, num_heads]
++                # query_start_loc format: [0, len_0, len_0+len_1, ...]
++                start_locs = query_start_loc[:len(forward_batch.reqs) + 1].tolist()
++                for i, req in enumerate(forward_batch.reqs):
++                    if not getattr(req, '_needs_factor_capture', False):
++                        continue
++                    start_idx = start_locs[i]
++                    end_idx = start_locs[i + 1]
++                    factor_seq_len = end_idx - start_idx
++
++                    if factor_seq_len > 0:
++                        # Store factors on the request for later attachment to tree node
++                        if not hasattr(req, "pending_lfc_factors") or req.pending_lfc_factors is None:
++                            req.pending_lfc_factors = {}
++                        # Store factors for this layer
++                        # Use explicit indexing for clarity: key shape [1, total_tokens, H, D]
++                        k_factors = key[0, start_idx:end_idx].clone()  # [num_tokens, H, D]
++                        v_factors = value[0, start_idx:end_idx].clone()  # [num_tokens, H, D]
++                        g_factors = g[0, start_idx:end_idx].clone()  # [num_tokens, H]
++                        beta_factors = beta[0, start_idx:end_idx].clone()  # [num_tokens, H]
++                        req.pending_lfc_factors[layer_id] = (
++                            k_factors,
++                            v_factors,
++                            g_factors,
++                            beta_factors,
++                        )
++
++            if timing_collector:
++                timing_collector.end_phase("catchup_recompute")
++
+         return core_attn_out
+ 
+ 
+@@ -796,6 +884,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
+         hidden_states: torch.Tensor,
+         output: torch.Tensor,
+         layer_id: int,
++        forward_batch: ForwardBatch = None,
+         mup_vector: Optional[torch.Tensor] = None,
+         use_triton_causal_conv: bool = False,
+     ):
+@@ -806,6 +895,8 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
+             output=output,
+             layer_cache=layer_cache,
+             metadata=self.forward_metadata,
++            forward_batch=forward_batch,
++            layer_id=layer_id,
+             mup_vector=mup_vector,
+             use_triton_causal_conv=use_triton_causal_conv,
+         )
+diff --git a/python/sglang/srt/layers/attention/mamba/mamba.py b/python/sglang/srt/layers/attention/mamba/mamba.py
+index 252028489..dfb61352c 100644
+--- a/python/sglang/srt/layers/attention/mamba/mamba.py
++++ b/python/sglang/srt/layers/attention/mamba/mamba.py
+@@ -1,3 +1,4 @@
++import math
+ from typing import Callable, List, Optional, Tuple
+ 
+ import torch
+@@ -31,6 +32,7 @@ from sglang.srt.model_loader.weight_utils import (
+     sharded_weight_loader,
+ )
+ from sglang.srt.utils import is_cuda, is_npu, set_weight_attrs
++from sglang.srt.utils.catchup_timing import is_lfc_enabled
+ 
+ if is_cuda():
+     from sglang.srt.layers.attention.mamba.causal_conv1d import (
+@@ -356,6 +358,8 @@ class MambaMixer2(torch.nn.Module):
+         output: torch.Tensor,
+         layer_cache: MambaPool.State,
+         metadata: Mamba2Metadata,
++        forward_batch=None,
++        layer_id: int = None,
+         mup_vector: Optional[torch.Tensor] = None,
+         use_triton_causal_conv: bool = False,
+     ):
+@@ -477,6 +481,30 @@ class MambaMixer2(torch.nn.Module):
+ 
+             hidden_states_p, B_p, C_p = split_hidden_states_B_C_fn(hidden_states_B_C_p)
+ 
++            # LFC: Check if enabled for factor capture/reconstruction
++            lfc_enabled = is_lfc_enabled()
++
++            # LFC: Factor capture - store factors for each request
++            # Factors: (hidden_states, B, C, dt) after conv1d projection
++            if lfc_enabled and forward_batch is not None and forward_batch.reqs is not None:
++                start_locs = query_start_loc_p[:num_prefills + 1].tolist()
++                for i, req in enumerate(forward_batch.reqs[:num_prefills]):
++                    if not getattr(req, '_needs_factor_capture', False):
++                        continue
++                    start_idx = start_locs[i]
++                    end_idx = start_locs[i + 1]
++                    factor_seq_len = end_idx - start_idx
++                    if factor_seq_len > 0:
++                        if not hasattr(req, "pending_lfc_factors") or req.pending_lfc_factors is None:
++                            req.pending_lfc_factors = {}
++                        # Store Mamba2-specific factors for this layer
++                        req.pending_lfc_factors[layer_id] = (
++                            hidden_states_p[start_idx:end_idx].clone(),
++                            B_p[start_idx:end_idx].clone(),
++                            C_p[start_idx:end_idx].clone(),
++                            dt_p[start_idx:end_idx].clone(),
++                        )
++
+             # 3. State Space Model sequence transformation
+             initial_states = None
+             if has_initial_states_p is not None and prep_initial_states:
+@@ -486,6 +514,98 @@ class MambaMixer2(torch.nn.Module):
+                     0,
+                 )
+ 
++            # LFC: State reconstruction from cached factors
++            # For Mamba2, use mamba_chunk_scan_combined to reconstruct state
++            # Factors are pre-merged (concat'd) per layer in match_prefix,
++            # so each layer only needs a single kernel call.
++            if lfc_enabled and forward_batch is not None and forward_batch.lfc_reconstruction_factors is not None:
++                cache_indices_list = state_indices_tensor_p[:num_prefills].tolist()
++
++                # Pre-allocate buffers for reconstruction metadata tensors
++                # Find max seq_len across all requests that need reconstruction
++                max_recon_seq_len = 0
++                for i in range(num_prefills):
++                    req_factors = forward_batch.lfc_reconstruction_factors.get(i)
++                    if req_factors is not None and layer_id in req_factors:
++                        max_recon_seq_len = max(
++                            max_recon_seq_len,
++                            req_factors[layer_id][0].shape[0],
++                        )
++
++                chunk_sz = mixed_metadata.chunk_size
++                if max_recon_seq_len > 0:
++                    recon_device = hidden_states.device
++                    max_chunks = math.ceil(max_recon_seq_len / chunk_sz)
++                    buf_seq_idx = torch.zeros(
++                        (1, max_recon_seq_len), dtype=torch.int32, device=recon_device
++                    )
++                    buf_chunk_indices = torch.arange(
++                        max_chunks, dtype=torch.int32, device=recon_device
++                    )
++                    buf_chunk_offsets = torch.zeros(
++                        max_chunks, dtype=torch.int32, device=recon_device
++                    )
++
++                for i in range(num_prefills):
++                    req_factors = forward_batch.lfc_reconstruction_factors.get(i)
++                    if req_factors is not None and layer_id in req_factors:
++                        factors = req_factors[layer_id]
++                        cache_idx = cache_indices_list[i]
++                        h_factors, B_factors, C_factors, dt_factors = factors
++                        seq_len = h_factors.shape[0]
++
++                        if seq_len > 0:
++                            nheads_tp = self.num_heads // self.tp_size
++                            ngroups_tp = self.n_groups // self.tp_size
++
++                            # Reshape for mamba_chunk_scan_combined
++                            h_reshaped = h_factors.view(1, seq_len, nheads_tp, self.head_dim)
++                            dt_reshaped = dt_factors.unsqueeze(0)
++                            B_reshaped = B_factors.view(1, seq_len, ngroups_tp, -1)
++                            C_reshaped = C_factors.view(1, seq_len, ngroups_tp, -1)
++
++                            # Use pre-allocated buffers via slice views
++                            n_chunks = math.ceil(seq_len / chunk_sz)
++                            recon_seq_idx = buf_seq_idx[:, :seq_len]
++                            recon_chunk_indices = buf_chunk_indices[:n_chunks]
++                            recon_chunk_offsets = buf_chunk_offsets[:n_chunks]
++
++                            recon_out = torch.empty_like(h_reshaped)
++                            # Cast initial_states to float32 and pass
++                            # state_dtype=float32 so internal states also
++                            # use float32. This avoids a Triton type
++                            # conflict (prev_states_ptr vs initstates_ptr).
++                            current_state = ssm_state[cache_idx:cache_idx + 1]
++                            init_fp32 = current_state.to(torch.float32)
++                            final_state = mamba_chunk_scan_combined(
++                                h_reshaped,
++                                dt_reshaped,
++                                self.A,
++                                B_reshaped,
++                                C_reshaped,
++                                chunk_size=chunk_sz,
++                                D=self.D,
++                                z=None,
++                                dt_bias=self.dt_bias,
++                                initial_states=init_fp32,
++                                seq_idx=recon_seq_idx,
++                                chunk_indices=recon_chunk_indices,
++                                chunk_offsets=recon_chunk_offsets,
++                                return_varlen_states=False,
++                                return_final_states=True,
++                                dt_softplus=True,
++                                dt_limit=(0.0, float("inf")),
++                                out=recon_out,
++                                state_dtype=torch.float32,
++                            )
++
++                            # Update SSM state with reconstructed state
++                            ssm_state[cache_idx] = final_state.squeeze(0).to(ssm_state.dtype)
++
++                        # Update initial_states if applicable
++                        if initial_states is not None:
++                            initial_states[i] = ssm_state[cache_idx]
++
+             # NOTE: final output is an in-place update of out tensor
+             varlen_state = mamba_chunk_scan_combined(
+                 hidden_states_p.view(
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index 2a26797e9..b5eb99929 100644
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -510,6 +510,17 @@ class Req:
+         # Memory pool info
+         self.req_pool_idx: Optional[int] = None
+         self.mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
++        # LFC factors pending attachment to tree node on cache
++        # Dict of {layer_id: (factors_tuple)} computed during forward pass
++        # Used for forward → tree direction (storing factors when caching)
++        self.pending_lfc_factors: Optional[dict] = None
++        # LFC factors for reconstruction from tree node chain
++        # Dict of {layer_id: List[Tuple]} collected during match_prefix
++        # Used for tree → forward direction (reconstructing state from cached factors)
++        self.lfc_reconstruction_factors: Optional[dict] = None
++        # Whether this request needs factor capture for LFC
++        # Set to True for prefill requests that will be inserted into the radix cache
++        self._needs_factor_capture: bool = False
+ 
+         # Check finish
+         self.tokenizer = None
+@@ -740,6 +751,20 @@ class Req:
+             self.last_matched_prefix_len = len(self.prefix_indices)
+         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
+ 
++        # LFC-METRIC: Log key metrics for LFC evaluation
++        # This helps measure the effectiveness of prefix caching with LFC
++        if isinstance(tree_cache, MambaRadixCache) and envs.SGLANG_LFC_ENABLED.get():
++            has_pending_lfc = (
++                hasattr(self, "pending_lfc_factors")
++                and self.pending_lfc_factors is not None
++                and len(self.pending_lfc_factors) > 0
++            )
++            logger.debug(
++                f"[LFC-METRIC] rid={self.rid} extend_input_len={self.extend_input_len} "
++                f"prefix_len={len(self.prefix_indices)} fill_ids_len={len(self.fill_ids)} "
++                f"has_pending_lfc={has_pending_lfc}"
++            )
++
+     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
+     def init_incremental_detokenize(self):
+         first_iter = self.surr_offset is None or self.read_offset is None
+@@ -1815,8 +1840,31 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
+             is_prefill_only=self.is_prefill_only,
+             dimensions=self.dimensions,
++            lfc_reconstruction_factors=self._collect_lfc_factors(),
++            reqs=self.reqs,
+         )
+ 
++    def _collect_lfc_factors(self) -> Optional[dict]:
++        """Collect LFC reconstruction factors from requests.
++        Also sets _needs_factor_capture on prefill requests when LFC is enabled.
++        """
++        from sglang.srt.utils.catchup_timing import is_lfc_enabled
++
++        lfc_enabled = is_lfc_enabled()
++
++        factors = {}
++        for i, req in enumerate(self.reqs):
++            # Set factor capture flag for prefill requests when LFC is enabled
++            if lfc_enabled:
++                req._needs_factor_capture = True
++
++            if (
++                hasattr(req, "lfc_reconstruction_factors")
++                and req.lfc_reconstruction_factors is not None
++            ):
++                factors[i] = req.lfc_reconstruction_factors
++        return factors if factors else None
++
+     def copy(self):
+         # Only contain fields that will be used by process_batch_result
+         return ScheduleBatch(
+@@ -1928,3 +1976,10 @@ class ModelWorkerBatch:
+ 
+     # Whether this batch is prefill-only (no token generation needed)
+     is_prefill_only: bool = False
++
++    # LFC (Linear Factor Caching) reconstruction factors for Mamba2/SSM models
++    # Dict[req_idx, Dict[layer_id, List[Tuple[hidden, B, C, dt]]]]
++    lfc_reconstruction_factors: Optional[dict] = None
++
++    # Reference to Req objects for LFC factor capture during forward pass
++    reqs: Optional[List] = None
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 24cb52182..51346f28d 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -400,7 +400,10 @@ class Scheduler(
+ 
+         # Hybrid memory pool
+         self.is_hybrid = self.tp_worker.is_hybrid
+-        self.is_hybrid_gdn = self.tp_worker.model_runner.hybrid_gdn_config is not None
++        self.is_hybrid_gdn = (
++            self.tp_worker.model_runner.hybrid_gdn_config is not None
++            or self.tp_worker.model_runner.mamba2_config is not None
++        )
+ 
+         if self.is_hybrid:
+             self.sliding_window_size = self.tp_worker.sliding_window_size
+diff --git a/python/sglang/srt/mem_cache/mamba_radix_cache.py b/python/sglang/srt/mem_cache/mamba_radix_cache.py
+index 7d930f112..f042f63e6 100644
+--- a/python/sglang/srt/mem_cache/mamba_radix_cache.py
++++ b/python/sglang/srt/mem_cache/mamba_radix_cache.py
+@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
+ import torch
+ from numpy import float64
+ 
++from sglang.srt.environ import envs
+ from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
+ from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+@@ -34,6 +35,7 @@ from sglang.srt.mem_cache.radix_cache import (
+     _key_match_page_size1,
+     get_child_key,
+ )
++from sglang.srt.utils.catchup_timing import get_timing_collector, is_timing_enabled
+ 
+ if TYPE_CHECKING:
+     from sglang.srt.managers.schedule_batch import Req
+@@ -54,6 +56,9 @@ class TreeNode:
+         self.key: RadixKey = None
+         self.value: Optional[torch.Tensor] = None
+         self.mamba_value: Optional[torch.Tensor] = None
++        # LFC factors for reconstructing SSM state when mamba_value is tombstoned
++        # Dict of {layer_id: (k, v, g, beta)} or None
++        self.lfc_factors: Optional[dict] = None
+         # invariant: for any node, if mamba_lock_ref is locked, full_lock_ref must be locked;
+         # if full_lock_ref is locked, mamba_lock_ref doesn't need to be locked. So,
+         # full_lock_ref is always >= mamba_lock_ref.
+@@ -360,6 +365,15 @@ class MambaRadixCache(BasePrefixCache):
+         self.full_lru_list = LRUList(mamba=False)
+         self.mamba_lru_list = LRUList(mamba=True)
+ 
++        # LFC memory budget management
++        budget_gb = envs.SGLANG_LFC_MEMORY_BUDGET_GB.value
++        self.lfc_memory_budget_bytes = int(budget_gb * 1024**3)
++        self.lfc_current_memory_bytes = 0
++        # Min-heap of (factor_value, node_id, node_ref) for eviction
++        self.lfc_factor_heap: list = []
++        # Map node_id -> bool for quick heap validity check (lazy deletion)
++        self.lfc_factor_nodes: dict = {}
++
+     def match_prefix(self, key: RadixKey, **kwargs) -> MatchResult:
+         """Find the matching prefix from the radix tree.
+         Args:
+@@ -374,6 +388,9 @@ class MambaRadixCache(BasePrefixCache):
+         cow_mamba: bool = kwargs.get("cow_mamba", False)
+         req: Req = kwargs.get("req", None)
+ 
++        # Get timing collector if enabled
++        timing_collector = get_timing_collector() if is_timing_enabled() else None
++
+         if self.disable or len(key) == 0:
+             return MatchResult(
+                 device_indices=torch.empty(
+@@ -385,10 +402,21 @@ class MambaRadixCache(BasePrefixCache):
+                 last_host_node=self.root_node,
+             )
+ 
++        # Time prefix matching phase
++        if timing_collector:
++            timing_collector.start_phase("prefix_match")
++
+         value, last_node = self._match_prefix_helper(key)
+ 
++        if timing_collector:
++            timing_collector.end_phase("prefix_match")
++
+         # copy mamba state to req local space if cow is true
+         if cow_mamba and last_node.mamba_value is not None:
++            # Time SSM state load phase
++            if timing_collector:
++                timing_collector.start_phase("ssm_state_load")
++
+             # for reqs without mamba cache
+             if req.mamba_pool_idx is None:
+                 dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
+@@ -407,6 +435,82 @@ class MambaRadixCache(BasePrefixCache):
+                 dst_index = req.mamba_pool_idx.unsqueeze(0)
+                 self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
+ 
++            if timing_collector:
++                timing_collector.end_phase("ssm_state_load")
++
++        elif cow_mamba and last_node.lfc_factors is not None:
++            # LFC path: reconstruct SSM state from ancestor + factor chain
++            if timing_collector:
++                timing_collector.start_phase("lfc_reconstruction")
++
++            # 1. Walk up to nearest ancestor with full SSM state (or root)
++            ancestor = last_node.parent
++            factor_chain = [last_node]
++            while ancestor and ancestor != self.root_node and ancestor.mamba_value is None:
++                if ancestor.lfc_factors is not None:
++                    factor_chain.append(ancestor)
++                ancestor = ancestor.parent
++
++            # ancestor now has mamba_value or is root_node
++            if ancestor is None:
++                ancestor = self.root_node
++            assert ancestor.mamba_value is not None or ancestor == self.root_node, \
++                "Ancestor must have SSM state or be root"
++
++            logger.debug(
++                f"[LFC] Reconstruction triggered: "
++                f"factor_chain_len={len(factor_chain)}, "
++                f"ancestor_id={ancestor.id}"
++            )
++
++            # 2. Allocate or get dst_index for req
++            if req.mamba_pool_idx is None:
++                dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
++                if dst_index is None:
++                    self.inc_lock_ref(last_node)
++                    self.evict_mamba(1)
++                    dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
++                    self.dec_lock_ref(last_node)
++                    assert dst_index is not None, "Can not alloc mamba cache"
++                req.mamba_pool_idx = dst_index[0]
++            else:
++                dst_index = req.mamba_pool_idx.unsqueeze(0)
++
++            # 3. Copy ancestor's SSM state as starting point
++            if ancestor.mamba_value is not None:
++                self.req_to_token_pool.mamba_pool.copy_from(
++                    ancestor.mamba_value, dst_index
++                )
++            # If ancestor is root with no mamba_value, state is already zero-initialized
++
++            # 4. Store reconstruction factors on request for use during forward
++            # The reconstruction will happen in forward_extend where we have access to
++            # the layer-specific state. We pass the factor chain to the request.
++            # Note: Use lfc_reconstruction_factors (tree → forward) not pending_lfc_factors (forward → tree)
++            # Pre-merge: collect factor chunks per layer, then concat into single tensors
++            # so that each layer only needs one kernel call during reconstruction.
++            layer_chunks = {}
++            for node in reversed(factor_chain):
++                if node.lfc_factors is not None:
++                    for layer_id, factors in node.lfc_factors.items():
++                        if layer_id not in layer_chunks:
++                            layer_chunks[layer_id] = []
++                        layer_chunks[layer_id].append(factors)
++
++            req.lfc_reconstruction_factors = {}
++            for layer_id, chunk_list in layer_chunks.items():
++                if len(chunk_list) == 1:
++                    req.lfc_reconstruction_factors[layer_id] = chunk_list[0]
++                else:
++                    # Concat all chunks along the sequence (time) dimension
++                    req.lfc_reconstruction_factors[layer_id] = tuple(
++                        torch.cat([c[j] for c in chunk_list], dim=0)
++                        for j in range(len(chunk_list[0]))
++                    )
++
++            if timing_collector:
++                timing_collector.end_phase("lfc_reconstruction")
++
+         if value:
+             value = torch.cat(value)
+         else:
+@@ -418,13 +522,15 @@ class MambaRadixCache(BasePrefixCache):
+             last_host_node=last_node,
+         )
+ 
+-    def insert(self, key: RadixKey, value=None, mamba_value=None) -> Tuple[int, bool]:
++    def insert(
++        self, key: RadixKey, value=None, mamba_value=None, lfc_factors=None
++    ) -> Tuple[int, bool]:
+         if self.disable:
+             return 0
+ 
+         if value is None:
+             value = torch.tensor([x for x in key.token_ids], dtype=torch.int64)
+-        return self._insert_helper(self.root_node, key, value, mamba_value)
++        return self._insert_helper(self.root_node, key, value, mamba_value, lfc_factors)
+ 
+     def cache_finished_req(self, req: Req, is_insert=True) -> None:
+         """Cache request when it finishes."""
+@@ -455,10 +561,13 @@ class MambaRadixCache(BasePrefixCache):
+         )
+ 
+         if is_insert:
++            # Get pending LFC factors from request if available
++            lfc_factors = getattr(req, "pending_lfc_factors", None)
+             new_prefix_len, mamba_exist = self.insert(
+                 RadixKey(token_ids[:page_aligned_len], req.extra_key),
+                 page_aligned_kv_indices,
+                 mamba_value,
++                lfc_factors=lfc_factors,
+             )
+             self.token_to_kv_pool_allocator.free(
+                 kv_indices[len(req.prefix_indices) : new_prefix_len]
+@@ -503,10 +612,13 @@ class MambaRadixCache(BasePrefixCache):
+                 mamba_value
+             )
+             assert mamba_value_forked is not None, "Can not alloc mamba cache"
++        # Get pending LFC factors from request if available
++        lfc_factors = getattr(req, "pending_lfc_factors", None)
+         new_prefix_len, mamba_exist = self.insert(
+             RadixKey(page_aligned_token_ids, req.extra_key),
+             page_aligned_kv_indices,
+             mamba_value_forked,
++            lfc_factors=lfc_factors,
+         )
+         self.token_to_kv_pool_allocator.free(
+             kv_indices[len(req.prefix_indices) : new_prefix_len]
+@@ -735,6 +847,96 @@ class MambaRadixCache(BasePrefixCache):
+ 
+     ##### Internal Helper Functions #####
+ 
++    @staticmethod
++    def _estimate_factor_memory(lfc_factors: dict) -> int:
++        """Estimate GPU memory usage of LFC factors in bytes."""
++        total = 0
++        for layer_id, factors in lfc_factors.items():
++            for t in factors:
++                total += t.numel() * t.element_size()
++        return total
++
++    @staticmethod
++    def _compute_factor_value(node: TreeNode) -> float:
++        """Compute value score for a node's LFC factors.
++
++        Higher value = more useful to keep.
++        Formula: hit_count * num_children / len(node.key)
++        """
++        key_len = len(node.key) if node.key else 1
++        num_children = len(node.children)
++        return node.hit_count * max(num_children, 1) / key_len
++
++    def _lfc_try_store_factors(self, node: TreeNode, lfc_factors: dict) -> bool:
++        """Try to store LFC factors on a node, respecting memory budget.
++
++        Returns True if factors were stored, False if rejected.
++        """
++        if lfc_factors is None:
++            return False
++
++        factor_bytes = self._estimate_factor_memory(lfc_factors)
++
++        # Budget not exceeded: store directly
++        if self.lfc_current_memory_bytes + factor_bytes <= self.lfc_memory_budget_bytes:
++            node.lfc_factors = lfc_factors
++            self.lfc_current_memory_bytes += factor_bytes
++            factor_value = self._compute_factor_value(node)
++            heapq.heappush(
++                self.lfc_factor_heap, (factor_value, node.id, node)
++            )
++            self.lfc_factor_nodes[node.id] = True
++            return True
++
++        # Budget exceeded: try to evict lowest-value factors
++        new_value = self._compute_factor_value(node)
++
++        # Evict until we have room or no more low-value nodes
++        while (
++            self.lfc_current_memory_bytes + factor_bytes > self.lfc_memory_budget_bytes
++            and self.lfc_factor_heap
++        ):
++            min_value, min_node_id, min_node = self.lfc_factor_heap[0]
++
++            # Lazy deletion: skip nodes already removed from tracking
++            if min_node_id not in self.lfc_factor_nodes:
++                heapq.heappop(self.lfc_factor_heap)
++                continue
++
++            # New node isn't more valuable than what we'd evict
++            if new_value <= min_value:
++                return False
++
++            # Evict the lowest-value node's factors
++            heapq.heappop(self.lfc_factor_heap)
++            del self.lfc_factor_nodes[min_node_id]
++            if min_node.lfc_factors is not None:
++                evicted_bytes = self._estimate_factor_memory(min_node.lfc_factors)
++                self.lfc_current_memory_bytes -= evicted_bytes
++                min_node.lfc_factors = None
++
++        # Check if we freed enough
++        if self.lfc_current_memory_bytes + factor_bytes <= self.lfc_memory_budget_bytes:
++            node.lfc_factors = lfc_factors
++            self.lfc_current_memory_bytes += factor_bytes
++            heapq.heappush(
++                self.lfc_factor_heap, (new_value, node.id, node)
++            )
++            self.lfc_factor_nodes[node.id] = True
++            return True
++
++        return False
++
++    def _lfc_remove_factors(self, node: TreeNode):
++        """Remove LFC factors from a node and update memory tracking."""
++        if node.lfc_factors is not None:
++            factor_bytes = self._estimate_factor_memory(node.lfc_factors)
++            self.lfc_current_memory_bytes -= factor_bytes
++            node.lfc_factors = None
++        # Lazy removal from heap - just remove from tracking dict
++        if node.id in self.lfc_factor_nodes:
++            del self.lfc_factor_nodes[node.id]
++
+     def _match_prefix_helper(
+         self, key: RadixKey
+     ) -> Tuple[List[torch.Tensor], TreeNode]:
+@@ -743,6 +945,10 @@ class MambaRadixCache(BasePrefixCache):
+         the matched node is guaranteed to either 1. connected to root without mamba tombstone,
+         or 2. the number of matching tokens from the matched node to the last mamba tombstone
+         node is greater than or equal to the sliding window size.
++
++        LFC Enhancement: Tracks factor chain validity to detect gap nodes.
++        A gap node (no mamba_value, no lfc_factors) breaks the factor chain,
++        preventing LFC reconstruction for nodes beyond the gap.
+         """
+         node = self.root_node
+         child_key = self.get_child_key_fn(key)
+@@ -750,12 +956,26 @@ class MambaRadixCache(BasePrefixCache):
+         value = []
+         best_value_len = 0
+         best_last_node = node
++        # LFC: Track if factor chain is unbroken from last mamba_value node
++        lfc_chain_valid = True
++
+         while len(key) > 0 and child_key in node.children.keys():
+             child = node.children[child_key]
+             # update best_value_len and best_last_node if needed
++            # LFC Enhancement: Check chain validity before accepting LFC-only nodes
+             if node.mamba_value is not None:
++                # Has full SSM state: unconditionally accept and reset chain
+                 best_value_len = len(value)
+                 best_last_node = node
++                lfc_chain_valid = True  # Reset chain validity
++            elif node.lfc_factors is not None and lfc_chain_valid:
++                # Has LFC factors AND chain is still valid: accept
++                best_value_len = len(value)
++                best_last_node = node
++            elif node.lfc_factors is None and node.mamba_value is None and node != self.root_node:
++                # Gap node (no mamba_value, no lfc_factors): chain breaks
++                lfc_chain_valid = False
++                # Do NOT update best_last_node - stop accepting LFC nodes
+ 
+             prefix_len = self.key_match_fn(child.key, key)
+             if prefix_len < len(child.key):
+@@ -771,9 +991,13 @@ class MambaRadixCache(BasePrefixCache):
+                 if len(key):
+                     child_key = self.get_child_key_fn(key)
+         # handle best_value_len and best_last_node, for the case that last node is fully matched
++        # LFC Enhancement: Apply same chain validity logic for final node
+         if node.mamba_value is not None:
+             best_value_len = len(value)
+             best_last_node = node
++        elif node.lfc_factors is not None and lfc_chain_valid:
++            best_value_len = len(value)
++            best_last_node = node
+ 
+         # update time for matched nodes, and make nodes closer to root to be least recently used
+         # this allows mamba to evict nodes closer to root first
+@@ -803,6 +1027,45 @@ class MambaRadixCache(BasePrefixCache):
+         new_node.key = child.key[:split_len]
+         new_node.value = child.value[:split_len]
+ 
++        # LFC Enhancement: Split lfc_factors if present
++        # new_node gets factors for tokens [0:split_len]
++        # child keeps factors for tokens [split_len:]
++        if child.lfc_factors is not None:
++            # Remove old child from memory tracking before split
++            old_bytes = self._estimate_factor_memory(child.lfc_factors)
++            if child.id in self.lfc_factor_nodes:
++                del self.lfc_factor_nodes[child.id]
++
++            new_node.lfc_factors = {}
++            for layer_id, (k, v, g, beta) in child.lfc_factors.items():
++                # Factors are stored as [seq_len, ...], split by token index
++                new_node.lfc_factors[layer_id] = (
++                    k[:split_len].clone(),
++                    v[:split_len].clone(),
++                    g[:split_len].clone(),
++                    beta[:split_len].clone(),
++                )
++                child.lfc_factors[layer_id] = (
++                    k[split_len:].clone(),
++                    v[split_len:].clone(),
++                    g[split_len:].clone(),
++                    beta[split_len:].clone(),
++                )
++
++            # Update memory tracking: remove old, add both new parts
++            new_node_bytes = self._estimate_factor_memory(new_node.lfc_factors)
++            child_bytes = self._estimate_factor_memory(child.lfc_factors)
++            self.lfc_current_memory_bytes += (new_node_bytes + child_bytes - old_bytes)
++
++            # Add both to heap
++            new_node_value = self._compute_factor_value(new_node)
++            heapq.heappush(self.lfc_factor_heap, (new_node_value, new_node.id, new_node))
++            self.lfc_factor_nodes[new_node.id] = True
++
++            child_value = self._compute_factor_value(child)
++            heapq.heappush(self.lfc_factor_heap, (child_value, child.id, child))
++            self.lfc_factor_nodes[child.id] = True
++
+         # child time should be later than parent's time for mamba tombstone
+         child.last_access_time = get_last_access_time()
+ 
+@@ -828,6 +1091,7 @@ class MambaRadixCache(BasePrefixCache):
+         key: RadixKey,
+         value,
+         mamba_value,
++        lfc_factors=None,
+     ) -> Tuple[int, bool]:
+         # Update the last access time from root to leaf, so that
+         # mamba will tombstone the node closer to root first
+@@ -868,6 +1132,9 @@ class MambaRadixCache(BasePrefixCache):
+             new_node.key = key
+             new_node.value = value
+             new_node.mamba_value = mamba_value
++            # Attach LFC factors with memory budget check
++            if lfc_factors is not None:
++                self._lfc_try_store_factors(new_node, lfc_factors)
+             self.full_lru_list.insert_mru(new_node)
+             self.mamba_lru_list.insert_mru(new_node)
+             node.children[child_key] = new_node
+@@ -875,6 +1142,9 @@ class MambaRadixCache(BasePrefixCache):
+             self.mamba_evictable_size_ += len(mamba_value)
+         elif node.mamba_value is None:  # add for mamba tombstone
+             node.mamba_value = mamba_value
++            # Attach LFC factors with memory budget check
++            if lfc_factors is not None:
++                self._lfc_try_store_factors(node, lfc_factors)
+             self.full_lru_list.reset_node_mru(node)
+             self.mamba_lru_list.insert_mru(node)
+             self.mamba_evictable_size_ += len(mamba_value)
+@@ -915,6 +1185,8 @@ class MambaRadixCache(BasePrefixCache):
+             node.mamba_value is not None
+         ), f"Invariant violated: leaf node is a tombstone, {node.id=}"
+         assert len(node.children) == 0, f"leaf node has children, {node.id=}"
++        # Clean up LFC factor memory tracking
++        self._lfc_remove_factors(node)
+         for k, v in node.parent.children.items():
+             if v == node:
+                 break
+@@ -926,12 +1198,16 @@ class MambaRadixCache(BasePrefixCache):
+         assert len(node.children) != 0, f"Cannot tombstone a leaf node, {node.id=}"
+         self.mamba_evictable_size_ -= len(node.mamba_value)
+         node.mamba_value = None
++        # Note: node.lfc_factors is intentionally preserved when tombstoning.
++        # LFC factors allow SSM state reconstruction at ~1% memory cost of full state.
+ 
+     def _delete_tombstone_leaf(self, node: TreeNode) -> None:
+         assert (
+             node.mamba_value is None
+         ), f"Deleting a unexpected non-tombstone leaf node, {node.id=}"
+         assert len(node.children) == 0, f"leaf node has children, {node.id=}"
++        # Clean up LFC factor memory tracking
++        self._lfc_remove_factors(node)
+         for k, v in node.parent.children.items():
+             if v == node:
+                 break
+diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
+index e222ae0f5..551edffbf 100644
+--- a/python/sglang/srt/mem_cache/memory_pool.py
++++ b/python/sglang/srt/mem_cache/memory_pool.py
+@@ -55,6 +55,7 @@ from sglang.srt.utils import (
+     is_npu,
+     next_power_of_2,
+ )
++from sglang.srt.utils.catchup_timing import is_lfc_enabled, get_snapshot_interval
+ 
+ if TYPE_CHECKING:
+     from sglang.srt.managers.cache_controller import LayerDoneCounter
+@@ -323,6 +324,10 @@ class MambaPool:
+         self.mamba_cache.temporal[:, dst_index] = self.mamba_cache.temporal[
+             :, src_index
+         ]
++
++        # Note: LFC factors are now stored per-TreeNode, not in MambaPool,
++        # so no factor copying is needed here.
++
+         return
+ 
+     def fork_from(self, src_index: torch.Tensor) -> Optional[torch.Tensor]:
+@@ -348,6 +353,148 @@ class MambaPool:
+             ]
+         return data_ptrs, data_lens, item_lens
+ 
++    # LFC (Linear Factor Caching) methods
++    def init_lfc_factor_pool(
++        self,
++        max_factors_per_slot: int,
++        num_heads: int,
++        key_dim: int,
++        value_dim: int,
++        dtype: torch.dtype = torch.float16,
++    ):
++        """
++        Initialize LFC factor storage pools.
++
++        Args:
++            max_factors_per_slot: Max factors per slot (typically K-1 for snapshot interval K)
++            num_heads: Number of attention heads
++            key_dim: Key dimension per head
++            value_dim: Value dimension per head
++            dtype: Data type for factor storage
++        """
++        self.lfc_enabled = True
++        self.max_factors_per_slot = max_factors_per_slot
++
++        # k_factor: [num_slots, max_factors, num_heads, key_dim]
++        self.k_factor_pool = torch.zeros(
++            (self.size + 1, max_factors_per_slot, num_heads, key_dim),
++            dtype=dtype,
++            device=self.device,
++        )
++
++        # v_factor: [num_slots, max_factors, num_heads, value_dim]
++        self.v_factor_pool = torch.zeros(
++            (self.size + 1, max_factors_per_slot, num_heads, value_dim),
++            dtype=dtype,
++            device=self.device,
++        )
++
++        # g_factor: [num_slots, max_factors, num_heads]
++        self.g_factor_pool = torch.zeros(
++            (self.size + 1, max_factors_per_slot, num_heads),
++            dtype=dtype,
++            device=self.device,
++        )
++
++        # beta_factor: [num_slots, max_factors, num_heads]
++        self.beta_factor_pool = torch.zeros(
++            (self.size + 1, max_factors_per_slot, num_heads),
++            dtype=dtype,
++            device=self.device,
++        )
++
++        # Track valid factor lengths per slot
++        self.factor_valid_len = torch.zeros(
++            self.size + 1, dtype=torch.int32, device=self.device
++        )
++
++        lfc_mem_usage = (
++            self.k_factor_pool.numel() * self.k_factor_pool.element_size() +
++            self.v_factor_pool.numel() * self.v_factor_pool.element_size() +
++            self.g_factor_pool.numel() * self.g_factor_pool.element_size() +
++            self.beta_factor_pool.numel() * self.beta_factor_pool.element_size()
++        ) / GB
++
++        logger.info(f"LFC Factor Pool initialized. Memory usage: {lfc_mem_usage:.2f}GB")
++
++    def has_lfc_factors(self) -> bool:
++        """Check if LFC factor pools are initialized."""
++        return hasattr(self, 'lfc_enabled') and self.lfc_enabled
++
++    def store_lfc_factors(
++        self,
++        slot_idx: int,
++        k_factors: torch.Tensor,
++        v_factors: torch.Tensor,
++        g_factors: torch.Tensor,
++        beta_factors: torch.Tensor,
++    ):
++        """
++        Store LFC factors for a given slot.
++
++        Args:
++            slot_idx: Slot index
++            k_factors: Key factors [delta, num_heads, key_dim]
++            v_factors: Value factors [delta, num_heads, value_dim]
++            g_factors: Gating factors [delta, num_heads]
++            beta_factors: Beta factors [delta, num_heads]
++        """
++        if not self.has_lfc_factors():
++            return
++
++        delta = k_factors.shape[0]
++        if delta > self.max_factors_per_slot:
++            # Truncate to max factors
++            delta = self.max_factors_per_slot
++            k_factors = k_factors[:delta]
++            v_factors = v_factors[:delta]
++            g_factors = g_factors[:delta]
++            beta_factors = beta_factors[:delta]
++
++        self.k_factor_pool[slot_idx, :delta] = k_factors
++        self.v_factor_pool[slot_idx, :delta] = v_factors
++        self.g_factor_pool[slot_idx, :delta] = g_factors
++        self.beta_factor_pool[slot_idx, :delta] = beta_factors
++        self.factor_valid_len[slot_idx] = delta
++
++    def load_lfc_factors(
++        self, slot_idx: int
++    ) -> Optional[tuple]:
++        """
++        Load LFC factors for a given slot.
++
++        Args:
++            slot_idx: Slot index
++
++        Returns:
++            Tuple of (k_factors, v_factors, g_factors, beta_factors) or None if not available
++        """
++        if not self.has_lfc_factors():
++            return None
++
++        valid_len = self.factor_valid_len[slot_idx].item()
++        if valid_len == 0:
++            return None
++
++        k_factors = self.k_factor_pool[slot_idx, :valid_len]
++        v_factors = self.v_factor_pool[slot_idx, :valid_len]
++        g_factors = self.g_factor_pool[slot_idx, :valid_len]
++        beta_factors = self.beta_factor_pool[slot_idx, :valid_len]
++
++        return k_factors, v_factors, g_factors, beta_factors
++
++    def get_lfc_factor_len(self, slot_idx: int) -> int:
++        """Get the number of valid LFC factors stored in a slot."""
++        if not self.has_lfc_factors():
++            return 0
++        return self.factor_valid_len[slot_idx].item()
++
++    def clear_lfc_factors(self, slot_idx: int):
++        """Clear LFC factors for a slot."""
++        if not self.has_lfc_factors():
++            return
++        self.factor_valid_len[slot_idx] = 0
++
+ 
+ class HybridReqToTokenPool(ReqToTokenPool):
+     """A memory pool that maps a request to its token locations."""
+diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
+index 4f843726f..ceb386559 100644
+--- a/python/sglang/srt/model_executor/forward_batch_info.py
++++ b/python/sglang/srt/model_executor/forward_batch_info.py
+@@ -318,6 +318,13 @@ class ForwardBatch:
+     # For matryoshka embeddings
+     dimensions: Optional[list[int]] = None
+ 
++    # LFC (Linear Factor Caching) reconstruction factors for Mamba2/SSM models
++    # Dict[req_idx, Dict[layer_id, List[Tuple[hidden, B, C, dt]]]]
++    lfc_reconstruction_factors: Optional[dict] = None
++
++    # Reference to Req objects for LFC factor capture during forward pass
++    reqs: Optional[List] = None
++
+     @classmethod
+     def init_new(
+         cls,
+@@ -360,6 +367,8 @@ class ForwardBatch:
+             token_type_ids=batch.token_type_ids,
+             tbo_split_seq_index=batch.tbo_split_seq_index,
+             dimensions=batch.dimensions,
++            lfc_reconstruction_factors=batch.lfc_reconstruction_factors,
++            reqs=batch.reqs,
+         )
+         device = model_runner.device
+ 
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index 963e2cd81..a80735b82 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -36,6 +36,7 @@ from sglang.srt.configs import (
+     Qwen3NextConfig,
+ )
+ from sglang.srt.configs.device_config import DeviceConfig
++from sglang.srt.environ import envs
+ from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+ from sglang.srt.configs.model_config import (
+     AttentionArch,
+@@ -153,6 +154,11 @@ from sglang.srt.utils.offloader import (
+     get_offloader,
+     set_offloader,
+ )
++from sglang.srt.utils.catchup_timing import (
++    CatchupTimingCollector,
++    get_timing_collector,
++    is_timing_enabled,
++)
+ from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+ from sglang.srt.weight_sync.tensor_bucket import (
+@@ -409,8 +415,19 @@ class ModelRunner:
+ 
+         if config := self.mamba2_config:
+             class_name = config.__class__.__name__
+-            logger.warning(f"{class_name} model detected, disable radix cache")
+-            self.server_args.disable_radix_cache = True
++            if envs.SGLANG_LFC_ENABLED.value:
++                logger.warning(
++                    f"{class_name} model detected, but LFC is enabled — "
++                    f"keeping radix cache active for LFC reconstruction"
++                )
++            elif envs.SGLANG_FORCE_RADIX_CACHE.value:
++                logger.warning(
++                    f"{class_name} model detected, but SGLANG_FORCE_RADIX_CACHE=1 — "
++                    f"keeping radix cache active (benchmark mode)"
++                )
++            else:
++                logger.warning(f"{class_name} model detected, disable radix cache")
++                self.server_args.disable_radix_cache = True
+ 
+         # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
+         # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
+@@ -1352,12 +1369,13 @@ class ModelRunner:
+                 * server_args.mamba_full_memory_ratio
+                 / (1 + server_args.mamba_full_memory_ratio)
+             )
+-            # calculate the max_mamba_cache_size based on the given total mamba memory
+-            server_args.max_mamba_cache_size = int(
+-                (mamba_state_memory_raw * (1 << 30))
+-                // config.mamba2_cache_params.mamba_cache_per_req
+-                // (1 + speculativa_ratio)
+-            )
++            if server_args.max_mamba_cache_size is None:
++                # calculate the max_mamba_cache_size based on the given total mamba memory
++                server_args.max_mamba_cache_size = int(
++                    (mamba_state_memory_raw * (1 << 30))
++                    // config.mamba2_cache_params.mamba_cache_per_req
++                    // (1 + speculativa_ratio)
++                )
+ 
+         if self.hybrid_gdn_config is not None:
+             server_args.max_mamba_cache_size = server_args.max_mamba_cache_size // (
+@@ -2074,6 +2092,23 @@ class ModelRunner:
+         skip_attn_backend_init: bool = False,
+         pp_proxy_tensors=None,
+     ) -> LogitsProcessorOutput:
++        # LFC timing instrumentation for total prefill
++        timing_collector = get_timing_collector() if is_timing_enabled() else None
++
++        if timing_collector:
++            # Start timing record with batch info
++            batch_size = forward_batch.batch_size
++            total_tokens = forward_batch.input_ids.shape[0] if forward_batch.input_ids is not None else 0
++            prefix_len = int(forward_batch.extend_prefix_lens.sum().item()) if forward_batch.extend_prefix_lens is not None else 0
++            timing_collector.start_record(
++                batch_size=batch_size,
++                total_tokens=total_tokens,
++                prefix_len=prefix_len,
++                delta=total_tokens - prefix_len,
++                mode="baseline",  # Will be updated if LFC is used
++            )
++            timing_collector.start_phase("total_prefill")
++
+         if not skip_attn_backend_init:
+             self.attn_backend.init_forward_metadata(forward_batch)
+ 
+@@ -2087,15 +2122,25 @@ class ModelRunner:
+ 
+         if self.piecewise_cuda_graph_runner is not None:
+             if self.piecewise_cuda_graph_runner.can_run(forward_batch):
+-                return self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs)
++                result = self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs)
++                if timing_collector:
++                    timing_collector.end_phase("total_prefill")
++                    timing_collector.end_record()
++                return result
+ 
+-        return self.model.forward(
++        result = self.model.forward(
+             forward_batch.input_ids,
+             forward_batch.positions,
+             forward_batch,
+             **kwargs,
+         )
+ 
++        if timing_collector:
++            timing_collector.end_phase("total_prefill")
++            timing_collector.end_record()
++
++        return result
++
+     def forward_idle(
+         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
+     ) -> LogitsProcessorOutput:
+diff --git a/python/sglang/srt/models/falcon_h1.py b/python/sglang/srt/models/falcon_h1.py
+index 0fab9e410..da03b263a 100644
+--- a/python/sglang/srt/models/falcon_h1.py
++++ b/python/sglang/srt/models/falcon_h1.py
+@@ -346,6 +346,7 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
+                 hidden_states * self.ssm_in_multiplier,
+                 mamba_hidden_states,
+                 layer_id=self.layer_id,
++                forward_batch=forward_batch,
+                 mup_vector=self.mup_vector,
+             )
+             mamba_hidden_states = mamba_hidden_states * self.ssm_out_multiplier

@@ -752,6 +752,8 @@ class SchedulerOutputProcessorMixin:
         prompt_tokens = []
         completion_tokens = []
         cached_tokens = []
+        attn_potential_hit_tokens = []
+        mamba_hit_tokens = []
         spec_verify_ct = []
         spec_accepted_tokens = []
         retraction_counts = []
@@ -860,6 +862,8 @@ class SchedulerOutputProcessorMixin:
                 prompt_tokens.append(len(req.origin_input_ids))
                 completion_tokens.append(len(output_ids_))
                 cached_tokens.append(req.cached_tokens)
+                attn_potential_hit_tokens.append(req.attn_potential_hit_tokens)
+                mamba_hit_tokens.append(req.mamba_hit_tokens)
                 retraction_counts.append(req.retraction_count)
 
                 queue_times.append(req.time_stats.get_queueing_time())
@@ -980,6 +984,8 @@ class SchedulerOutputProcessorMixin:
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     cached_tokens=cached_tokens,
+                    attn_potential_hit_tokens=attn_potential_hit_tokens,
+                    mamba_hit_tokens=mamba_hit_tokens,
                     input_token_logprobs_val=input_token_logprobs_val,
                     input_token_logprobs_idx=input_token_logprobs_idx,
                     output_token_logprobs_val=output_token_logprobs_val,
@@ -1008,6 +1014,8 @@ class SchedulerOutputProcessorMixin:
         embeddings = []
         prompt_tokens = []
         cached_tokens = []
+        attn_potential_hit_tokens = []
+        mamba_hit_tokens = []
         queue_times = []
         forward_entry_times = []
         prefill_launch_delays = []
@@ -1021,6 +1029,8 @@ class SchedulerOutputProcessorMixin:
                 embeddings.append(req.embedding)
                 prompt_tokens.append(len(req.origin_input_ids))
                 cached_tokens.append(req.cached_tokens)
+                attn_potential_hit_tokens.append(req.attn_potential_hit_tokens)
+                mamba_hit_tokens.append(req.mamba_hit_tokens)
 
                 queue_times.append(req.time_stats.get_queueing_time())
                 forward_entry_times.append(req.time_stats.forward_entry_time)
@@ -1042,6 +1052,8 @@ class SchedulerOutputProcessorMixin:
                 embeddings=embeddings,
                 prompt_tokens=prompt_tokens,
                 cached_tokens=cached_tokens,
+                attn_potential_hit_tokens=attn_potential_hit_tokens,
+                mamba_hit_tokens=mamba_hit_tokens,
                 placeholder_tokens_idx=None,
                 placeholder_tokens_val=None,
                 retraction_counts=retraction_counts,

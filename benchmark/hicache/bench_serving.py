@@ -60,6 +60,9 @@ class RequestFuncOutput:
     latency: List[float] = field(default_factory=list)
     ttft: List[float] = field(default_factory=list)
     itl: List[float] = field(default_factory=list)  # List of inter-token latencies
+    cached_tokens: List[int] = field(default_factory=list)
+    attn_potential_hit_tokens: List[int] = field(default_factory=list)
+    mamba_hit_tokens: List[int] = field(default_factory=list)
 
     success: bool = False
     error: str = ""
@@ -145,6 +148,10 @@ async def async_request_openai_completions(
                             if data["usage"] is not None and len(data["usage"]) > 0:
                                 actual_prompt_len = data["usage"]["prompt_tokens"]
                                 actual_output_len = data["usage"]["completion_tokens"]
+                                details = data["usage"].get("prompt_tokens_details") or {}
+                                output.cached_tokens.append(details.get("cached_tokens", 0))
+                                output.attn_potential_hit_tokens.append(details.get("attn_potential_hit_tokens", 0))
+                                output.mamba_hit_tokens.append(details.get("mamba_hit_tokens", 0))
                                 continue
                             delta = data["choices"][0]["delta"]
 
@@ -256,6 +263,8 @@ class BenchmarkMetrics:
     std_e2e_latency_ms: float
     p99_e2e_latency_ms: float
     concurrency: float
+    attn_token_hit_rate: float
+    mamba_token_hit_rate: float
 
 
 async def get_requests(
@@ -325,6 +334,17 @@ def calculate_metrics(
             output_lens.append(0)
             retokenized_output_lens.append(0)
 
+    # Aggregate mamba vs attention hit rate metrics
+    total_attn_potential = 0
+    total_mamba_hit = 0
+    for i in range(len(outputs)):
+        if outputs[i].success:
+            total_attn_potential += sum(outputs[i].attn_potential_hit_tokens)
+            total_mamba_hit += sum(outputs[i].mamba_hit_tokens)
+
+    attn_token_hit_rate = total_attn_potential / total_input if total_input > 0 else 0.0
+    mamba_token_hit_rate = total_mamba_hit / total_input if total_input > 0 else 0.0
+
     if completed == 0:
         warnings.warn(
             "All requests failed. This is likely due to a misconfiguration "
@@ -364,6 +384,8 @@ def calculate_metrics(
         std_e2e_latency_ms=np.std(e2e_latencies) * 1000,
         p99_e2e_latency_ms=np.percentile(e2e_latencies, 99) * 1000,
         concurrency=np.sum(e2e_latencies) / dur_s,
+        attn_token_hit_rate=attn_token_hit_rate,
+        mamba_token_hit_rate=mamba_token_hit_rate,
     )
 
     return metrics, output_lens
@@ -574,6 +596,17 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("Median ITL (ms):", metrics.median_itl_ms))
     print("{:<40} {:<10.2f}".format("P90 ITL (ms):", metrics.p90_itl_ms))
     print("{:<40} {:<10.2f}".format("P99 ITL (ms):", metrics.p99_itl_ms))
+    print("{s:{c}^{n}}".format(s="Mamba vs Attention Hit Rate", n=50, c="-"))
+    print(
+        "{:<40} {:<10.4f}".format(
+            "Attn Token Hit Rate:", metrics.attn_token_hit_rate
+        )
+    )
+    print(
+        "{:<40} {:<10.4f}".format(
+            "Mamba Token Hit Rate:", metrics.mamba_token_hit_rate
+        )
+    )
     print("=" * 50)
 
     if (
@@ -617,6 +650,8 @@ async def benchmark(
             "std_itl_ms": metrics.std_itl_ms,
             "p99_itl_ms": metrics.p99_itl_ms,
             "concurrency": metrics.concurrency,
+            "attn_token_hit_rate": metrics.attn_token_hit_rate,
+            "mamba_token_hit_rate": metrics.mamba_token_hit_rate,
             "input_throughput": metrics.input_throughput,
             "output_throughput": metrics.output_throughput,
             "fixed_output_len": args.fixed_output_len,
@@ -755,8 +790,14 @@ def run_benchmark(args_: argparse.Namespace):
             sys.exit(1)
 
     if args.enable_shared_prefix:
-        if args.dataset_name not in ["loogle", "nextqa"]:
-            print("Shared prefix is only supported for loogle and nextqa datasets.")
+        if args.dataset_name not in [
+            "loogle",
+            "nextqa",
+            "generated-shared-prefix",
+        ]:
+            print(
+                "Shared prefix is only supported for loogle, nextqa, and generated-shared-prefix datasets."
+            )
             sys.exit(1)
 
     print(f"{args}\n")
@@ -823,6 +864,7 @@ if __name__ == "__main__":
             "ultrachat",
             "loogle",
             "nextqa",
+            "longbench",
         ],
         help="Name of the dataset to benchmark on.",
     )

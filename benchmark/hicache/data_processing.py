@@ -503,6 +503,84 @@ def sample_generated_shared_prefix_requests(
     return input_requests
 
 
+def sample_longbench_requests(
+    num_requests: int,
+    tokenizer: PreTrainedTokenizerBase,
+    fixed_output_len: Optional[int] = None,
+    chunk_size: int = 1024,
+    disable_shuffle: bool = False,
+    enable_multiturn: bool = True,
+) -> SampleOutput:
+    """Load LongBench dataset and construct append-only multi-turn conversations.
+
+    Each sample's context is split into chunks (~chunk_size tokens each).
+    Multi-turn conversation is built as:
+      Turn 1: "Read the following passage:\n{chunk1}\nSummarize what you've read."
+      Turn 2: "Continue reading:\n{chunk2}\nUpdate your summary."
+      ...
+      Final turn: Uses the original question from LongBench.
+    """
+    from datasets import load_dataset
+
+    ds = load_dataset("zai-org/LongBench", split="train")
+
+    new_dataset = []
+    for sample in ds:
+        context = sample.get("context", "")
+        question = sample.get("input", "")
+        if not context or not question:
+            continue
+
+        # Split context into chunks by token length
+        context_tokens = tokenizer.encode(context)
+        chunks = []
+        for start in range(0, len(context_tokens), chunk_size):
+            chunk_tokens = context_tokens[start : start + chunk_size]
+            chunk_text = tokenizer.decode(chunk_tokens, skip_special_tokens=True)
+            chunks.append(chunk_text)
+
+        if not chunks:
+            continue
+
+        # Build multi-turn conversation
+        chat = []
+        if enable_multiturn and len(chunks) > 1:
+            # First turn
+            prompt1 = f"Read the following passage:\n{chunks[0]}\nSummarize what you've read."
+            chat.append((prompt1, "Here is a summary of what I've read so far."))
+
+            # Middle turns
+            for chunk in chunks[1:-1]:
+                prompt = f"Continue reading:\n{chunk}\nUpdate your summary."
+                chat.append((prompt, "Here is my updated summary."))
+
+            # Final turn with original question
+            last_chunk = chunks[-1]
+            final_prompt = f"Continue reading:\n{last_chunk}\n\nNow answer this question: {question}"
+            chat.append((final_prompt, "Based on the passage, here is my answer."))
+        else:
+            # Single turn: full context + question
+            full_prompt = f"Read the following passage:\n{context}\n\n{question}"
+            chat.append((full_prompt, "Based on the passage, here is my answer."))
+
+        new_dataset.append(chat)
+
+    if not disable_shuffle:
+        random.shuffle(new_dataset)
+
+    filtered_dataset: SampleOutput = common_filter_chat(
+        num_requests,
+        new_dataset,
+        tokenizer,
+        min_prompt_len=4,
+        min_output_len=4,
+        max_prompt_len=None,
+        max_output_len=None,
+        fixed_output_len=fixed_output_len,
+    )
+    return filtered_dataset
+
+
 def get_dataset(args, tokenizer):
     if args.dataset_name == "sharegpt":
         input_requests = sample_sharegpt_requests(
@@ -563,6 +641,14 @@ def get_dataset(args, tokenizer):
             output_len=args.gsp_output_len,
             args=args,
             tokenizer=tokenizer,
+        )
+    elif args.dataset_name == "longbench":
+        input_requests = sample_longbench_requests(
+            num_requests=args.num_prompts,
+            tokenizer=tokenizer,
+            fixed_output_len=args.fixed_output_len,
+            disable_shuffle=args.disable_shuffle,
+            enable_multiturn=args.enable_multiturn,
         )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
