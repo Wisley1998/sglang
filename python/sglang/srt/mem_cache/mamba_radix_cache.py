@@ -362,6 +362,8 @@ class MambaRadixCache(BasePrefixCache):
         # LRU lists are used to maintain the order of eviction of the nodes in the tree
         self.full_lru_list = LRUList(mamba=False)
         self.mamba_lru_list = LRUList(mamba=True)
+        # Track nodes with deferred LFC promotions (node id(obj) -> node ref)
+        self._pending_promo_nodes: set = set()
 
         # LFC memory budget management (only active when LFC is enabled)
         if is_lfc_enabled():
@@ -743,6 +745,7 @@ class MambaRadixCache(BasePrefixCache):
         pending_promo = getattr(x, '_lfc_pending_mamba_value', None)
         if pending_promo is not None:
             self.req_to_token_pool.mamba_pool.free(pending_promo)
+            self._pending_promo_nodes.discard(id(x))
             del x._lfc_pending_mamba_value
 
         # 2. get the next node, update the lru lists
@@ -778,6 +781,7 @@ class MambaRadixCache(BasePrefixCache):
             # Only promote if node still lacks mamba_value and no pending promotion
             if promo_node.mamba_value is None and not hasattr(promo_node, '_lfc_pending_mamba_value'):
                 promo_node._lfc_pending_mamba_value = promo_slot.unsqueeze(0)
+                self._pending_promo_nodes.add(id(promo_node))
                 logger.debug(
                     f"[LFC] Deferred promotion to node {promo_node.id}"
                 )
@@ -797,10 +801,30 @@ class MambaRadixCache(BasePrefixCache):
         if pending is not None:
             node.mamba_value = pending
             del node._lfc_pending_mamba_value
+            self._pending_promo_nodes.discard(id(node))
+            self.mamba_evictable_size_ += len(pending)
+            node.last_access_time = get_last_access_time()
             self.mamba_lru_list.insert_mru(node)
+            # Also reposition in full_lru_list since last_access_time changed
+            if node.id in self.full_lru_list.cache:
+                self.full_lru_list._remove_node(node)
+                self.full_lru_list._add_node(node)
             logger.debug(
                 f"[LFC] Realized promotion on node {node.id}"
             )
+
+    def realize_all_pending_promotions(self):
+        """Realize all deferred LFC promotions. Safe to call during idle time
+        when no requests hold lock_refs."""
+        # Walk all nodes to find pending promotions (set tracks by id())
+        if not self._pending_promo_nodes:
+            return
+        stack = [self.root_node]
+        while stack:
+            node = stack.pop()
+            if id(node) in self._pending_promo_nodes:
+                self._realize_pending_promotion(node)
+            stack.extend(node.children.values())
 
     def evict_mamba(self, mamba_num: int) -> None:
         if self.disable or mamba_num <= 0:
@@ -1465,6 +1489,7 @@ class MambaRadixCache(BasePrefixCache):
         pending_promo = getattr(node, '_lfc_pending_mamba_value', None)
         if pending_promo is not None:
             self.req_to_token_pool.mamba_pool.free(pending_promo)
+            self._pending_promo_nodes.discard(id(node))
             del node._lfc_pending_mamba_value
         # Clean up LFC factor memory tracking
         if is_lfc_enabled():

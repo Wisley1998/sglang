@@ -297,6 +297,10 @@ class SchedulerRuntimeCheckerMixin:
             if queue_size:
                 return
 
+        # Realize deferred LFC promotions before memory/sanity checks
+        if hasattr(self, 'tree_cache') and hasattr(self.tree_cache, 'realize_all_pending_promotions'):
+            self.tree_cache.realize_all_pending_promotions()
+
         self.check_memory()
         self.check_tree_cache()
         self.new_token_ratio = self.init_new_token_ratio
