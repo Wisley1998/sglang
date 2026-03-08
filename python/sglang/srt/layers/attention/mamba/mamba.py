@@ -4,6 +4,8 @@ from typing import Callable, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
+_LFC_FACTOR_DTYPE = torch.float16
+
 from sglang.srt.configs.mamba_utils import (
     Mamba2CacheParams,
     extra_groups_for_head_shards,
@@ -492,7 +494,7 @@ class MambaMixer2(torch.nn.Module):
 
             # LFC: Factor capture - store factors for each request
             # Factors: (hidden_states, B, C, dt) after conv1d projection
-            if lfc_enabled and forward_batch is not None and forward_batch.reqs is not None:
+            if lfc_enabled and getattr(forward_batch, 'lfc_has_capture_reqs', False):
                 # Cache .tolist() on forward_batch to avoid per-layer GPU syncs
                 if not hasattr(forward_batch, '_lfc_mamba_start_locs'):
                     forward_batch._lfc_mamba_start_locs = query_start_loc_p[:num_prefills + 1].tolist()
@@ -516,10 +518,10 @@ class MambaMixer2(torch.nn.Module):
                                 if req.pending_lfc_factors is None:
                                     req.pending_lfc_factors = {}
                                 req.pending_lfc_factors[layer_id] = (
-                                    hidden_states_p[start:end].clone(),
-                                    B_p[start:end].clone(),
-                                    C_p[start:end].clone(),
-                                    dt_p[start:end].clone(),
+                                    hidden_states_p[start:end].to(_LFC_FACTOR_DTYPE),
+                                    B_p[start:end].to(_LFC_FACTOR_DTYPE),
+                                    C_p[start:end].to(_LFC_FACTOR_DTYPE),
+                                    dt_p[start:end].to(_LFC_FACTOR_DTYPE),
                                 )
                     else:
                         # Batch path: 4 clones for entire batch + zero-cost split
@@ -528,10 +530,10 @@ class MambaMixer2(torch.nn.Module):
                         total_len = total_end - total_offset
 
                         if total_len > 0:
-                            h_batch = hidden_states_p[total_offset:total_end].clone()
-                            b_batch = B_p[total_offset:total_end].clone()
-                            c_batch = C_p[total_offset:total_end].clone()
-                            dt_batch = dt_p[total_offset:total_end].clone()
+                            h_batch = hidden_states_p[total_offset:total_end].to(_LFC_FACTOR_DTYPE)
+                            b_batch = B_p[total_offset:total_end].to(_LFC_FACTOR_DTYPE)
+                            c_batch = C_p[total_offset:total_end].to(_LFC_FACTOR_DTYPE)
+                            dt_batch = dt_p[total_offset:total_end].to(_LFC_FACTOR_DTYPE)
 
                             seq_lens = [start_locs[i + 1] - start_locs[i] for i in range(num_prefills)]
                             h_splits = h_batch.split(seq_lens)
@@ -563,7 +565,8 @@ class MambaMixer2(torch.nn.Module):
             # Factors are pre-merged (concat'd) per layer in match_prefix,
             # so each layer only needs a single kernel call.
             # Batched: pack all requests into a single varlen call.
-            if lfc_enabled and forward_batch is not None and forward_batch.lfc_reconstruction_factors is not None:
+            _recon_layers = getattr(forward_batch, 'lfc_recon_layer_ids', None)
+            if lfc_enabled and _recon_layers is not None and layer_id in _recon_layers:
                 # Cache .tolist() on forward_batch to avoid per-layer GPU syncs
                 if not hasattr(forward_batch, '_lfc_mamba_cache_indices_list'):
                     forward_batch._lfc_mamba_cache_indices_list = state_indices_tensor_p[:num_prefills].tolist()

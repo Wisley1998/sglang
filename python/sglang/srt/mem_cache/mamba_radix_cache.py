@@ -58,6 +58,8 @@ class TreeNode:
         # LFC factors for reconstructing SSM state when mamba_value is tombstoned
         # Dict of {layer_id: (k, v, g, beta)} or None
         self.lfc_factors: Optional[dict] = None
+        # CPU-offloaded LFC factors (pinned memory), used when GPU budget is exceeded
+        self.lfc_host_factors: Optional[dict] = None
         # invariant: for any node, if mamba_lock_ref is locked, full_lock_ref must be locked;
         # if full_lock_ref is locked, mamba_lock_ref doesn't need to be locked. So,
         # full_lock_ref is always >= mamba_lock_ref.
@@ -372,6 +374,10 @@ class MambaRadixCache(BasePrefixCache):
             budget_gb = envs.SGLANG_LFC_MEMORY_BUDGET_GB.value
             self.lfc_memory_budget_bytes = int(budget_gb * 1024**3)
             self.lfc_current_memory_bytes = 0
+            # CPU pinned memory budget for offloaded factors
+            host_budget_gb = envs.SGLANG_LFC_HOST_MEMORY_BUDGET_GB.value
+            self.lfc_host_memory_budget_bytes = int(host_budget_gb * 1024**3)
+            self.lfc_host_current_memory_bytes = 0
             # Min-heap of (factor_value, node_id, node_ref) for eviction
             self.lfc_factor_heap: list = []
             # Map node_id -> bool for quick heap validity check (lazy deletion)
@@ -450,14 +456,14 @@ class MambaRadixCache(BasePrefixCache):
                 dst_index = req.mamba_pool_idx.unsqueeze(0)
                 self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
 
-        elif cow_mamba and is_lfc_enabled() and last_node.lfc_factors is not None:
+        elif cow_mamba and is_lfc_enabled() and (last_node.lfc_factors is not None or last_node.lfc_host_factors is not None):
             req._got_mamba_cow = True  # Flag: state came from LFC reconstruction
             # LFC path: reconstruct SSM state from ancestor + factor chain
             # 1. Walk up to nearest ancestor with full SSM state (or root)
             ancestor = last_node.parent
             factor_chain = [last_node]
             while ancestor and ancestor != self.root_node and ancestor.mamba_value is None:
-                if ancestor.lfc_factors is not None:
+                if ancestor.lfc_factors is not None or ancestor.lfc_host_factors is not None:
                     factor_chain.append(ancestor)
                 ancestor = ancestor.parent
 
@@ -506,7 +512,11 @@ class MambaRadixCache(BasePrefixCache):
             # Pre-merge: collect factor chunks per layer, then concat into single tensors
             # so that each layer only needs one kernel call during reconstruction.
             layer_chunks = {}
+            _host_loaded_nodes = []
             for node in reversed(factor_chain):
+                if node.lfc_factors is None and node.lfc_host_factors is not None:
+                    self._lfc_load_from_host(node)
+                    _host_loaded_nodes.append(node)
                 if node.lfc_factors is not None:
                     for layer_id, factors in node.lfc_factors.items():
                         if layer_id not in layer_chunks:
@@ -516,7 +526,13 @@ class MambaRadixCache(BasePrefixCache):
             req.lfc_reconstruction_factors = {}
             for layer_id, chunk_list in layer_chunks.items():
                 if len(chunk_list) == 1:
-                    req.lfc_reconstruction_factors[layer_id] = chunk_list[0]
+                    if _host_loaded_nodes:
+                        # Clone to decouple from ephemeral GPU tensors
+                        req.lfc_reconstruction_factors[layer_id] = tuple(
+                            f.clone() for f in chunk_list[0]
+                        )
+                    else:
+                        req.lfc_reconstruction_factors[layer_id] = chunk_list[0]
                 else:
                     # Single allocation + indexed copy (avoids torch.cat's per-call
                     # dispatch overhead and internal temporary allocation)
@@ -536,6 +552,10 @@ class MambaRadixCache(BasePrefixCache):
                             offset += n
                         result.append(buf)
                     req.lfc_reconstruction_factors[layer_id] = tuple(result)
+
+            # Release ephemeral GPU copies from host-loaded nodes
+            for node in _host_loaded_nodes:
+                node.lfc_factors = None
 
             # 5. Allocate promotion slot to cache reconstruction result on prefix node.
             # After forward, the reconstructed state will be assigned to last_node.mamba_value
@@ -918,13 +938,13 @@ class MambaRadixCache(BasePrefixCache):
             return
 
         if node.mamba_value is not None:
-            assert (
-                node.mamba_lock_ref > 0
-            ), f"dec_lock_ref on node with {node.mamba_lock_ref=}, {node.id=}"
-            if node.mamba_lock_ref == 1:
-                self.mamba_evictable_size_ += len(node.mamba_value)
-                self.mamba_protected_size_ -= len(node.mamba_value)
-            node.mamba_lock_ref -= 1
+            if node.mamba_lock_ref > 0:
+                if node.mamba_lock_ref == 1:
+                    self.mamba_evictable_size_ += len(node.mamba_value)
+                    self.mamba_protected_size_ -= len(node.mamba_value)
+                node.mamba_lock_ref -= 1
+            # else: mamba_value was acquired after this request locked the node
+            #       (e.g., via deferred snapshot promotion). Skip decrement.
 
         while node != self.root_node:
             assert (
@@ -1078,6 +1098,7 @@ class MambaRadixCache(BasePrefixCache):
             if min_node.lfc_factors is not None:
                 evicted_bytes = self._estimate_factor_memory(min_node.lfc_factors)
                 self.lfc_current_memory_bytes -= evicted_bytes
+                self._lfc_offload_to_host(min_node)
                 min_node.lfc_factors = None
 
         # Check if we freed enough
@@ -1110,9 +1131,63 @@ class MambaRadixCache(BasePrefixCache):
             factor_bytes = self._estimate_factor_memory(node.lfc_factors)
             self.lfc_current_memory_bytes -= factor_bytes
             node.lfc_factors = None
+        self._lfc_remove_host_factors(node)
         # Lazy removal from heap - just remove from tracking dict
         if node.id in self.lfc_factor_nodes:
             del self.lfc_factor_nodes[node.id]
+
+    def _lfc_offload_to_host(self, node: TreeNode):
+        """Move GPU factors to CPU pinned memory. Called during eviction."""
+        if node.lfc_factors is None:
+            return
+        factor_bytes = self._estimate_factor_memory(node.lfc_factors)
+        if self.lfc_host_current_memory_bytes + factor_bytes > self.lfc_host_memory_budget_bytes:
+            logger.warning(
+                f"[LFC-OFFLOAD] No host room for node {node.id} "
+                f"({factor_bytes/1024/1024:.1f}MB), discarding. "
+                f"Host used: {self.lfc_host_current_memory_bytes/1024/1024:.1f}MB / "
+                f"{self.lfc_host_memory_budget_bytes/1024/1024:.1f}MB"
+            )
+            return  # No host room — discard
+        host_factors = {}
+        for layer_id, factor_tuple in node.lfc_factors.items():
+            host_factors[layer_id] = tuple(
+                torch.empty_like(t, device="cpu", pin_memory=True).copy_(t)
+                for t in factor_tuple
+            )
+        node.lfc_host_factors = host_factors
+        self.lfc_host_current_memory_bytes += factor_bytes
+        logger.warning(
+            f"[LFC-OFFLOAD] Offloaded node {node.id} to host "
+            f"({factor_bytes/1024/1024:.1f}MB, {len(node.lfc_factors)} layers). "
+            f"GPU: {self.lfc_current_memory_bytes/1024/1024:.1f}MB / "
+            f"{self.lfc_memory_budget_bytes/1024/1024:.1f}MB, "
+            f"Host: {self.lfc_host_current_memory_bytes/1024/1024:.1f}MB"
+        )
+
+    def _lfc_load_from_host(self, node: TreeNode) -> bool:
+        """Load host factors to GPU temporarily. Returns True if loaded."""
+        if node.lfc_host_factors is None:
+            return False
+        gpu_factors = {}
+        for layer_id, factor_tuple in node.lfc_host_factors.items():
+            gpu_factors[layer_id] = tuple(
+                t.to(self.device, non_blocking=False) for t in factor_tuple
+            )
+        node.lfc_factors = gpu_factors
+        factor_bytes = self._estimate_factor_memory(gpu_factors)
+        logger.warning(
+            f"[LFC-LOAD] Loaded node {node.id} from host "
+            f"({factor_bytes/1024/1024:.1f}MB, {len(gpu_factors)} layers)"
+        )
+        return True
+
+    def _lfc_remove_host_factors(self, node: TreeNode):
+        """Remove host factors and update tracking."""
+        if node.lfc_host_factors is not None:
+            factor_bytes = self._estimate_factor_memory(node.lfc_host_factors)
+            self.lfc_host_current_memory_bytes -= factor_bytes
+            node.lfc_host_factors = None
 
     def _match_prefix_helper(
         self, key: RadixKey
@@ -1147,13 +1222,14 @@ class MambaRadixCache(BasePrefixCache):
                 best_last_node = node
                 if lfc_enabled:
                     lfc_chain_valid = True  # Reset chain validity
-            elif lfc_enabled and node.lfc_factors is not None and lfc_chain_valid:
-                # Has LFC factors AND chain is still valid: accept
+            elif lfc_enabled and (node.lfc_factors is not None or node.lfc_host_factors is not None) and lfc_chain_valid:
+                # Has LFC factors (GPU or host) AND chain is still valid: accept
                 best_value_len = len(value)
                 best_last_node = node
             elif (
                 lfc_enabled
                 and node.lfc_factors is None
+                and node.lfc_host_factors is None
                 and node.mamba_value is None
                 and node != self.root_node
             ):
@@ -1180,7 +1256,7 @@ class MambaRadixCache(BasePrefixCache):
         if node.mamba_value is not None:
             best_value_len = len(value)
             best_last_node = node
-        elif lfc_enabled and node.lfc_factors is not None and lfc_chain_valid:
+        elif lfc_enabled and (node.lfc_factors is not None or node.lfc_host_factors is not None) and lfc_chain_valid:
             best_value_len = len(value)
             best_last_node = node
 
@@ -1255,6 +1331,19 @@ class MambaRadixCache(BasePrefixCache):
             child_value = self._compute_factor_value(child)
             heapq.heappush(self.lfc_factor_heap, (child_value, child.id, child))
             self.lfc_factor_nodes[child.id] = True
+
+        # LFC Enhancement: Split host factors if present (CPU offloaded)
+        if is_lfc_enabled() and child.lfc_host_factors is not None:
+            old_host_bytes = self._estimate_factor_memory(child.lfc_host_factors)
+            new_node.lfc_host_factors = {}
+            for layer_id, factors in child.lfc_host_factors.items():
+                new_node.lfc_host_factors[layer_id] = tuple(t[:split_len] for t in factors)
+                child.lfc_host_factors[layer_id] = tuple(
+                    t[split_len:].clone() for t in factors
+                )
+            new_host_bytes = self._estimate_factor_memory(new_node.lfc_host_factors)
+            child_host_bytes = self._estimate_factor_memory(child.lfc_host_factors)
+            self.lfc_host_current_memory_bytes += (new_host_bytes + child_host_bytes - old_host_bytes)
 
         # child time should be later than parent's time for mamba tombstone
         child.last_access_time = get_last_access_time()

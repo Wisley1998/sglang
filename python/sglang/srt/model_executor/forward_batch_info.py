@@ -387,6 +387,10 @@ class ForwardBatch:
     # LFC (Linear Factor Caching) reconstruction factors for Mamba2/SSM models
     lfc_reconstruction_factors: Optional[dict] = None
 
+    # LFC batch-level flags for O(1) per-layer skipping
+    lfc_has_capture_reqs: bool = False
+    lfc_recon_layer_ids: Optional[frozenset] = None
+
     # Reference to Req objects for LFC factor capture during forward pass
     reqs: Optional[list] = None
 
@@ -431,6 +435,8 @@ class ForwardBatch:
             tbo_split_seq_index=batch.tbo_split_seq_index,
             dimensions=batch.dimensions,
             lfc_reconstruction_factors=batch.lfc_reconstruction_factors,
+            lfc_has_capture_reqs=batch.lfc_has_capture_reqs,
+            lfc_recon_layer_ids=batch.lfc_recon_layer_ids,
             reqs=batch.reqs,
         )
         device = model_runner.device

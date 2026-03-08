@@ -3,6 +3,8 @@ from typing import Optional, Union
 import torch
 from einops import rearrange
 
+_LFC_FACTOR_DTYPE = torch.float16
+
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
 from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
@@ -740,8 +742,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # This reconstructs state from ancestor snapshot + factor chain
             # Supports batch_size > 1 by handling each request individually
             # Note: Use lfc_reconstruction_factors (tree -> forward) not pending_lfc_factors (forward -> tree)
+            _recon_layers = getattr(forward_batch, 'lfc_recon_layer_ids', None)
             lfc_reconstruction_factors = getattr(forward_batch, "lfc_reconstruction_factors", None)
-            if lfc_enabled and lfc_reconstruction_factors is not None and not getattr(forward_batch, '_lfc_gdn_reconstructed', False):
+            if lfc_enabled and _recon_layers is not None and layer_id in _recon_layers and not getattr(forward_batch, '_lfc_gdn_reconstructed', False):
                 num_reqs = query_start_loc.shape[0] - 1
                 # Cache .tolist() on forward_batch to avoid per-layer GPU syncs
                 if not hasattr(forward_batch, '_lfc_gdn_cache_indices_list'):
@@ -815,7 +818,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # Store factors for future LFC reconstruction when caching this request
             # Supports batch_size > 1 by handling each request individually
             reqs = getattr(forward_batch, "reqs", None)
-            if lfc_enabled and reqs is not None:
+            if lfc_enabled and getattr(forward_batch, 'lfc_has_capture_reqs', False) and reqs is not None:
                 # key, value: [1, total_tokens, num_heads, head_dim]
                 # g, beta: [1, total_tokens, num_heads] (or similar broadcast shape)
                 # query_start_loc format: [0, len_0, len_0+len_1, ...]
@@ -841,10 +844,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                                 if req.pending_lfc_factors is None:
                                     req.pending_lfc_factors = {}
                                 req.pending_lfc_factors[layer_id] = (
-                                    key[0, start:end].clone(),
-                                    value[0, start:end].clone(),
-                                    g[0, start:end].clone(),
-                                    beta[0, start:end].clone(),
+                                    key[0, start:end].to(_LFC_FACTOR_DTYPE),
+                                    value[0, start:end].to(_LFC_FACTOR_DTYPE),
+                                    g[0, start:end].to(_LFC_FACTOR_DTYPE),
+                                    beta[0, start:end].to(_LFC_FACTOR_DTYPE),
                                 )
                     else:
                         # Batch path: 4 clones for entire batch + zero-cost split
@@ -853,10 +856,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                         total_len = total_end - total_offset
 
                         if total_len > 0:
-                            k_batch = key[0, total_offset:total_end].clone()
-                            v_batch = value[0, total_offset:total_end].clone()
-                            g_batch = g[0, total_offset:total_end].clone()
-                            b_batch = beta[0, total_offset:total_end].clone()
+                            k_batch = key[0, total_offset:total_end].to(_LFC_FACTOR_DTYPE)
+                            v_batch = value[0, total_offset:total_end].to(_LFC_FACTOR_DTYPE)
+                            g_batch = g[0, total_offset:total_end].to(_LFC_FACTOR_DTYPE)
+                            b_batch = beta[0, total_offset:total_end].to(_LFC_FACTOR_DTYPE)
 
                             seq_lens = [start_locs[i + 1] - start_locs[i] for i in range(len(reqs))]
                             k_splits = k_batch.split(seq_lens)

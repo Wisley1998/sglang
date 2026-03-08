@@ -2021,6 +2021,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             reqs=self.reqs,
             has_grammar=self.has_grammar,
             lfc_reconstruction_factors=self._collect_lfc_factors(),
+            lfc_has_capture_reqs=getattr(self, '_lfc_has_capture_reqs', False),
+            lfc_recon_layer_ids=getattr(self, '_lfc_recon_layer_ids', None),
         )
 
     def _collect_lfc_factors(self) -> Optional[dict]:
@@ -2046,7 +2048,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if not lfc_enabled:
             return None
 
+        # Skip factor capture during decode — output tokens are unique
+        # and almost never reused. This eliminates clone overhead from
+        # every decode step across all layers.
+        if self.forward_mode.is_decode_or_idle():
+            for req in self.reqs:
+                req._needs_factor_capture = False
+            self._lfc_has_capture_reqs = False
+            self._lfc_recon_layer_ids = None
+            return None
+
         factors = {}
+        has_capture = False
+        recon_layer_ids = set()
         for i, req in enumerate(self.reqs):
             has_lfc_recon = (
                 hasattr(req, "lfc_reconstruction_factors")
@@ -2062,9 +2076,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # Skip when: got CoW or LFC reconstruction (snapshot/factors already
             # cover this position; the suffix is unique and won't be reused).
             req._needs_factor_capture = not got_mamba_cow
+            if not got_mamba_cow:
+                has_capture = True
 
             if has_lfc_recon:
                 factors[i] = req.lfc_reconstruction_factors
+                recon_layer_ids.update(req.lfc_reconstruction_factors.keys())
+
+        self._lfc_has_capture_reqs = has_capture
+        self._lfc_recon_layer_ids = frozenset(recon_layer_ids) if recon_layer_ids else None
         return factors if factors else None
 
     def copy(self):
@@ -2191,3 +2211,7 @@ class ModelWorkerBatch:
     # LFC (Linear Factor Caching) reconstruction factors for Mamba2/SSM models
     # Dict[req_idx, Dict[layer_id, List[Tuple[hidden, B, C, dt]]]]
     lfc_reconstruction_factors: Optional[dict] = None
+
+    # LFC batch-level flags for O(1) per-layer skipping
+    lfc_has_capture_reqs: bool = False
+    lfc_recon_layer_ids: Optional[frozenset] = None
