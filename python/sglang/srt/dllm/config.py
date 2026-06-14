@@ -18,6 +18,8 @@ class DllmConfig:
         self.block_size = block_size
         self.mask_id = mask_id
         self.max_running_requests = max_running_requests
+        self.half_step = bool(algorithm_config.get("half_step", False))
+        self.yield_every = algorithm_config.get("yield_every", 8)
 
     @staticmethod
     def from_server_args(
@@ -61,7 +63,7 @@ class DllmConfig:
                     "`pip install pyyaml`"
                 )
             with open(server_args.dllm_algorithm_config, "r") as f:
-                algorithm_config = yaml.safe_load(f)
+                algorithm_config = yaml.safe_load(f) or {}
 
             # Parse common algorithm configurations
             block_size = algorithm_config.get("block_size", block_size)

@@ -15,6 +15,7 @@
 
 import dataclasses
 import logging
+import os
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -126,11 +127,15 @@ class LogitsProcessorOutput:
 
     ## Part 4: Diffusion LLM only.
     full_logits: Optional[torch.Tensor] = None
+    dllm_argmax_token_ids: Optional[torch.Tensor] = None
+    dllm_max_logits: Optional[torch.Tensor] = None
+    dllm_logsumexp: Optional[torch.Tensor] = None
 
     ## Part 5: Customized Info
     customized_info: Optional[Dict[str, List[Any]]] = None
 
     mm_input_embeds: Optional[torch.Tensor] = None
+    dllm_reduced_logits: bool = False
 
 
 @dataclasses.dataclass
@@ -225,6 +230,11 @@ class LogitsMetadata:
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.SUM_LEN,
             mm_input_embeds=forward_batch.mm_input_embeds,
+            dllm_reduced_logits=bool(
+                getattr(forward_batch, "dllm_reduced_logits", False)
+                or os.environ.get("SGLANG_DLLM_REDUCED_LOGITS", "0").strip().lower()
+                in {"1", "true", "yes", "on"}
+            ),
         )
 
     def compute_dp_attention_metadata(self):
@@ -993,10 +1003,33 @@ class LogitsProcessor(nn.Module):
         logits_metadata: LogitsMetadata,
     ) -> LogitsProcessorOutput:
         assert self.return_full_logits
+        if logits_metadata.dllm_reduced_logits:
+            return self._get_dllm_reduced_logits(
+                hidden_states, lm_head, logits_metadata
+            )
         full_logits = self._get_logits(hidden_states, lm_head, logits_metadata)
         return LogitsProcessorOutput(
             full_logits=full_logits,
             next_token_logits=None,
+        )
+
+    def _get_dllm_reduced_logits(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
+    ) -> LogitsProcessorOutput:
+        """Return JointThreshold statistics without returning full logits."""
+        logits = self._get_logits(hidden_states, lm_head, logits_metadata)
+        valid_logits = logits[:, : self.vocab_size]
+        max_logits, argmax_token_ids = torch.max(valid_logits, dim=-1)
+        logsumexp = torch.logsumexp(valid_logits, dim=-1)
+        return LogitsProcessorOutput(
+            next_token_logits=None,
+            full_logits=None,
+            dllm_argmax_token_ids=argmax_token_ids.to(torch.long),
+            dllm_max_logits=max_logits,
+            dllm_logsumexp=logsumexp,
         )
 
     def compute_logprobs_for_multi_item_scoring(

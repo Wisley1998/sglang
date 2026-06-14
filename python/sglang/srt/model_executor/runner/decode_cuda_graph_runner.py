@@ -962,6 +962,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.buffers.input_embeds[: self.raw_num_token].copy_(
                     forward_batch.input_embeds
                 )
+            if self.capture_forward_mode.is_dllm_extend():
+                attn_backend = (
+                    self.model_runner.decode_attn_backend_group[
+                        get_current_stream_idx()
+                    ]
+                    if self.enable_pdmux
+                    else self.attn_backend
+                )
+                attn_backend._dllm_replay_prefix_lens = forward_batch.extend_prefix_lens
             variant_label = self._resolve_lora_variant(forward_batch)
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
             self._replay_graph_key = self._make_graph_key(
@@ -1028,6 +1037,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             capture_forward_mode=self.capture_forward_mode,
             is_encoder_decoder=self.is_encoder_decoder,
         )
+        if self.capture_forward_mode.is_dllm_extend():
+            attn_backend._dllm_replay_prefix_lens = forward_batch.extend_prefix_lens
         attn_backend.init_forward_metadata_out_graph(fb_view)
 
         # Store fields
@@ -1068,6 +1079,21 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     if output.full_logits is not None
                     else None
                 )
+                dllm_argmax_token_ids = (
+                    output.dllm_argmax_token_ids[: self.raw_num_token]
+                    if getattr(output, "dllm_argmax_token_ids", None) is not None
+                    else None
+                )
+                dllm_max_logits = (
+                    output.dllm_max_logits[: self.raw_num_token]
+                    if getattr(output, "dllm_max_logits", None) is not None
+                    else None
+                )
+                dllm_logsumexp = (
+                    output.dllm_logsumexp[: self.raw_num_token]
+                    if getattr(output, "dllm_logsumexp", None) is not None
+                    else None
+                )
             else:
                 full_logits = None
                 next_token_logits = (
@@ -1075,10 +1101,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     if output.next_token_logits is not None
                     else None
                 )
+                dllm_argmax_token_ids = None
+                dllm_max_logits = None
+                dllm_logsumexp = None
 
             return LogitsProcessorOutput(
                 next_token_logits=next_token_logits,
                 full_logits=full_logits,
+                dllm_argmax_token_ids=dllm_argmax_token_ids,
+                dllm_max_logits=dllm_max_logits,
+                dllm_logsumexp=dllm_logsumexp,
                 hidden_states=(
                     output.hidden_states[: self.raw_num_token]
                     if output.hidden_states is not None

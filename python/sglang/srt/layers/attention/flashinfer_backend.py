@@ -569,12 +569,17 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=spec_info,
             )
         elif forward_mode.is_dllm_extend():
+            prefix_lens = getattr(self, "_dllm_replay_prefix_lens", None)
+            if prefix_lens is None:
+                prefix_lens = seq_lens - self.dllm_config.block_size
+            else:
+                prefix_lens = prefix_lens[:bs]
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
-                prefix_lens=seq_lens - self.dllm_config.block_size,
+                prefix_lens=prefix_lens,
                 prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
                 use_ragged=not self.use_paged,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,

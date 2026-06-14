@@ -32,7 +32,7 @@ import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -367,6 +367,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     lora_ids: Optional[List[str]] = None
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
+    reqs: Optional[List[Any]] = None
 
     # === Resolved from SB one-shot overrides (consumed + reset by init_new) ===
     capture_hidden_mode: CaptureHiddenMode = None
@@ -480,6 +481,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # wrapper plans and view-context plans must keep this False — a
     # forward-path re-plan would clobber their metadata.
     forward_metadata_replan_equivalent: bool = False
+
+    @property
+    def prefix_lens(self) -> Optional[torch.Tensor]:
+        return self.extend_prefix_lens
 
     def mark_forward_metadata_ready(self, replan_equivalent: bool = False):
         """Record that attention metadata was pre-planned for this batch.
@@ -652,6 +657,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_lens_cpu=batch.encoder_lens_cpu,
             lora_ids=[req.lora_id for req in batch.reqs],
             rids=[req.rid for req in batch.reqs],
+            reqs=batch.reqs,
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,
